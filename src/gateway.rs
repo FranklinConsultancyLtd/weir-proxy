@@ -1,5 +1,5 @@
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
                 proxy(state, headers, method, path, body, Provider::Anthropic)
             }),
         )
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
@@ -270,6 +271,44 @@ mod tests {
             upstream_req.headers.get("host").map(|v| v.to_str().unwrap()),
             Some("weir.internal.example"),
             "the client-facing Host header must not override the upstream provider's own host"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_request_body_is_not_rejected_by_default_body_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: {}\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = state_with_tenant("acct_1", 1000);
+        state.openai_base = mock.uri();
+        let app = router(state);
+
+        // Larger than Axum's default 2MB request-body limit.
+        let large_body = vec![b'x'; 3 * 1024 * 1024];
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header(TENANT_HEADER, "acct_1")
+                    .body(AxumBody::from(large_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a request body larger than axum's default 2MB limit must not be rejected"
         );
     }
 }
