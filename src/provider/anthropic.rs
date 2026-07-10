@@ -43,6 +43,12 @@ struct AnthropicInputUsage {
 struct AnthropicDelta {
     #[serde(default)]
     text: Option<String>,
+    // Present on tool-use content blocks: incremental fragments of the
+    // tool call's JSON input, streamed the same way `text` is streamed
+    // for a text content block. Must be counted too, or a tool-call-heavy
+    // stream's interim estimate stays near zero.
+    #[serde(default)]
+    partial_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +74,9 @@ impl ProviderAdapter for AnthropicAdapter {
                 AnthropicEvent::ContentBlockDelta { delta } => {
                     if let Some(t) = delta.text {
                         estimated_tokens += self.tokenizer.encode_ordinary(&t).len() as u64;
+                    }
+                    if let Some(json) = delta.partial_json {
+                        estimated_tokens += self.tokenizer.encode_ordinary(&json).len() as u64;
                     }
                 }
                 AnthropicEvent::MessageDelta { usage } => {
@@ -123,5 +132,20 @@ mod tests {
         );
         let cost = adapter.chunk_cost(&delta);
         assert_eq!(cost.authoritative_total, Some(40)); // 25 input + 15 output
+    }
+
+    #[test]
+    fn estimates_tokens_from_tool_use_partial_json() {
+        let mut adapter = AnthropicAdapter::new(tokenizer());
+        let raw = Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\": \\\"San Francisco, CA\\\"}\"}}\n\n",
+        );
+        let cost = adapter.chunk_cost(&raw);
+        assert!(
+            cost.estimated_tokens >= 3,
+            "tool-use partial_json should tokenize to a meaningful count, got {}",
+            cost.estimated_tokens
+        );
+        assert_eq!(cost.authoritative_total, None);
     }
 }

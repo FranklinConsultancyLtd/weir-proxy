@@ -30,6 +30,20 @@ struct OpenAiChoice {
 #[derive(Deserialize, Default)]
 struct OpenAiDelta {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCallDelta>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiToolCallDelta {
+    #[serde(default)]
+    function: Option<OpenAiFunctionDelta>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +67,15 @@ impl ProviderAdapter for OpenAiAdapter {
             for choice in &chunk.choices {
                 if let Some(content) = &choice.delta.content {
                     estimated_tokens += self.tokenizer.encode_ordinary(content).len() as u64;
+                }
+                for tool_call in &choice.delta.tool_calls {
+                    let Some(function) = &tool_call.function else { continue };
+                    if let Some(name) = &function.name {
+                        estimated_tokens += self.tokenizer.encode_ordinary(name).len() as u64;
+                    }
+                    if let Some(arguments) = &function.arguments {
+                        estimated_tokens += self.tokenizer.encode_ordinary(arguments).len() as u64;
+                    }
                 }
             }
             if let Some(usage) = chunk.usage {
@@ -122,5 +145,32 @@ mod tests {
         // may not parse as valid JSON depending on replacement characters, but
         // either way chunk_cost must return normally.
         let _ = cost;
+    }
+
+    #[test]
+    fn estimates_tokens_from_tool_call_arguments() {
+        let mut adapter = OpenAiAdapter::new(tokenizer());
+        let raw = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\": \\\"San Francisco, CA\\\"}\"}}]}}]}\n\n",
+        );
+        let cost = adapter.chunk_cost(&raw);
+        assert!(
+            cost.estimated_tokens >= 5,
+            "tool call name + arguments should tokenize to a meaningful count, got {}",
+            cost.estimated_tokens
+        );
+    }
+
+    #[test]
+    fn tool_call_delta_with_no_content_still_estimates_correctly() {
+        // A tool-call-only chunk with no `content` field at all — the
+        // adapter must not panic or skip the tool_calls entirely just
+        // because `content` is absent.
+        let mut adapter = OpenAiAdapter::new(tokenizer());
+        let raw = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"partial json fragment\"}}]}}]}\n\n",
+        );
+        let cost = adapter.chunk_cost(&raw);
+        assert!(cost.estimated_tokens >= 1);
     }
 }
