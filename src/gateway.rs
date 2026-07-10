@@ -49,6 +49,38 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Headers that must never be blindly forwarded between Weir and an
+/// upstream provider: hop-by-hop headers (meaningful only for one specific
+/// connection, not the end-to-end request/response) plus `content-length`
+/// (inaccurate once the body is re-streamed).
+fn is_hop_by_hop(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+    )
+}
+
+/// True if this client request header should be forwarded upstream
+/// unmodified. Excludes Weir's own routing header, `host` (must be derived
+/// from the actual upstream URL, not copied from the client-facing
+/// request), `accept-encoding` (Weir's HTTP client doesn't decompress
+/// responses, so honoring a client's compression request would make the
+/// adapter parse compressed bytes as SSE text — a silent enforcement
+/// bypass, since it would estimate near-zero tokens for content it can't
+/// read), and general hop-by-hop headers.
+fn should_forward_request_header(name: &HeaderName) -> bool {
+    let n = name.as_str();
+    n != TENANT_HEADER && n != "host" && n != "accept-encoding" && !is_hop_by_hop(name)
+}
+
 async fn proxy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -79,7 +111,7 @@ async fn proxy(
 
     let mut upstream_req = state.http.request(method, &url).body(body);
     for (name, value) in headers.iter() {
-        if name.as_str() != TENANT_HEADER && name.as_str() != "host" {
+        if should_forward_request_header(name) {
             upstream_req = upstream_req.header(name, value);
         }
     }
@@ -90,6 +122,7 @@ async fn proxy(
     };
 
     let status = upstream_res.status();
+    let upstream_headers = upstream_res.headers().clone();
     let adapter = state.tokenizer.new_adapter(provider);
     let stream = enforcer::enforce(
         tenant,
@@ -99,11 +132,17 @@ async fn proxy(
         now_ms,
     );
 
-    let mut response = Response::builder()
-        .status(status)
-        .header("content-type", "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap();
+    let mut response_builder = Response::builder().status(status);
+    for (name, value) in upstream_headers.iter() {
+        if !is_hop_by_hop(name) {
+            response_builder = response_builder.header(name, value);
+        }
+    }
+    if !upstream_headers.contains_key(axum::http::header::CONTENT_TYPE) {
+        response_builder = response_builder.header("content-type", "text/event-stream");
+    }
+
+    let mut response = response_builder.body(Body::from_stream(stream)).unwrap();
     response.headers_mut().insert(
         HeaderName::from_static("connection"),
         HeaderValue::from_static("close"),
