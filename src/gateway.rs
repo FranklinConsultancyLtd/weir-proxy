@@ -79,7 +79,7 @@ async fn proxy(
 
     let mut upstream_req = state.http.request(method, &url).body(body);
     for (name, value) in headers.iter() {
-        if name.as_str() != TENANT_HEADER {
+        if name.as_str() != TENANT_HEADER && name.as_str() != "host" {
             upstream_req = upstream_req.header(name, value);
         }
     }
@@ -177,5 +177,60 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get("connection").unwrap(), "close");
+    }
+
+    #[tokio::test]
+    async fn successful_proxy_strips_tenant_header_forwards_auth_and_sets_connection_close() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("data: {\"choices\":[{\"delta\":{}}]}\n\n", "text/event-stream"),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut state = state_with_tenant("acct_1", 1000);
+        state.openai_base = mock.uri();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header(TENANT_HEADER, "acct_1")
+                    .header("authorization", "Bearer real-secret")
+                    .header("host", "weir.internal.example")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("connection").unwrap(), "close");
+
+        let received = mock.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let upstream_req = &received[0];
+        assert_eq!(
+            upstream_req.headers.get("authorization").unwrap(),
+            "Bearer real-secret",
+            "client's real credentials must reach the upstream provider unmodified"
+        );
+        assert!(
+            !upstream_req.headers.contains_key("x-weir-tenant"),
+            "Weir's own routing header must never be forwarded upstream"
+        );
+        assert_ne!(
+            upstream_req.headers.get("host").map(|v| v.to_str().unwrap()),
+            Some("weir.internal.example"),
+            "the client-facing Host header must not override the upstream provider's own host"
+        );
     }
 }
