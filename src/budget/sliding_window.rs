@@ -109,36 +109,51 @@ impl SlidingWindowCounter {
                 continue;
             }
 
-            if new_index.wrapping_sub(old_index) == 1 {
-                // First writer into the next window: advance `current` and
-                // carry the old window's final count into `previous`.
+            if is_ahead(new_index, old_index) {
+                // We're moving `current` forward — either a normal one-window
+                // rollover, or resyncing after an idle gap longer than one
+                // window. Either way this write must never be silently
+                // dropped: dropping here would freeze the limiter fail-open
+                // after any sufficiently long idle period.
                 let next_packed = pack(new_index, clamp_u32(amount));
                 if self
                     .current
                     .compare_exchange(packed, next_packed, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    self.merge_into_previous(old_index, old_count);
+                    if new_index.wrapping_sub(old_index) == 1 {
+                        // Genuine adjacent rollover: carry the old window's
+                        // final count into `previous`.
+                        self.merge_into_previous(old_index, old_count);
+                    } else {
+                        // Gap of more than one window: the window immediately
+                        // before this one legitimately saw zero usage during
+                        // the idle period — that's what belongs in `previous`,
+                        // not `old_count`, which belongs to a window that is
+                        // no longer adjacent to the new current.
+                        self.merge_into_previous(new_index.wrapping_sub(1), 0);
+                    }
                     return self.estimate(now_ms);
                 }
                 continue;
             }
 
             if old_index.wrapping_sub(new_index) == 1 {
-                // We're lagging: another, more-advanced writer already
-                // rolled `current` forward past our window. Our
-                // contribution belongs in `previous` — never regress
+                // We're lagging by exactly one window: another, more-advanced
+                // writer already rolled `current` forward past our window.
+                // Our contribution belongs in `previous` — never regress
                 // `current` to fix this up.
                 self.merge_into_previous(new_index, clamp_u32(amount));
                 return self.estimate(now_ms);
             }
 
-            // More than one window away in either direction: this
-            // contribution no longer overlaps the tracked rolling window
-            // at all. In real usage, concurrent callers' `now_ms` values
-            // are always close together in wall-clock time relative to
-            // window sizes (seconds to hours), so this is unreachable in
-            // practice; drop it rather than corrupting either slot.
+            // We're lagging by more than one window: this contribution no
+            // longer overlaps the tracked rolling window at all (not even
+            // `previous`). Drop it — there is nothing safe or meaningful to
+            // add it to. Unlike the forward-gap case above, this cannot
+            // freeze the limiter: `current` is unaffected here and will
+            // still advance normally the next time a caller isn't this far
+            // behind.
             return self.estimate(now_ms);
         }
     }
@@ -243,5 +258,45 @@ mod tests {
         // carries weight (1000-100)/1000 = 0.9 -> round(4000*0.9) = 3600.
         // total = 4000 (current) + 3600 (weighted previous) = 7600.
         assert_eq!(counter.estimate(1100), 7600);
+    }
+
+    #[test]
+    fn add_after_idle_gap_resyncs_and_records_the_contribution() {
+        let c = SlidingWindowCounter::new(Duration::from_millis(1000));
+        c.add(100, 0); // bucket 0
+        // Idle gap of several windows, then a fresh add — must not be dropped.
+        let total = c.add(50, 5000); // bucket 5, far beyond adjacency to bucket 0
+        assert_eq!(
+            total, 50,
+            "the add after a multi-window idle gap must be recorded, not silently dropped"
+        );
+        assert_eq!(c.estimate(5000), 50);
+
+        // The counter must also have resynced `current` to the new window, so
+        // a subsequent add in the SAME new window accumulates normally.
+        let total2 = c.add(10, 5100);
+        assert_eq!(total2, 60);
+    }
+
+    #[test]
+    fn concurrent_adds_after_idle_gap_are_not_lost() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let counter = Arc::new(SlidingWindowCounter::new(Duration::from_millis(1000)));
+        counter.add(100, 0); // establish an old window, then go idle
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let counter = counter.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..500 {
+                    counter.add(1, 5000); // far-future bucket: concurrent resync race
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.estimate(5000), 4000);
     }
 }
