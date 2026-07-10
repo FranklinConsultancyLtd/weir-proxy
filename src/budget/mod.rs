@@ -31,6 +31,17 @@ impl BudgetRegistry {
     }
 
     fn counter_for(&self, tenant: &str, limit: BudgetLimit) -> Arc<SlidingWindowCounter> {
+        // Fast path: try a borrowed lookup first to avoid allocating an
+        // owned `String` key on every call — this runs on the hot path,
+        // once per SSE event, not once per request.
+        if let Some(existing) = self.counters.get(tenant) {
+            if existing.0 == limit.window {
+                return existing.1.clone();
+            }
+        }
+
+        // Cache miss, or the tenant's configured window changed: fall back
+        // to the owning `entry` API, which needs an owned key to insert.
         let mut entry = self
             .counters
             .entry(tenant.to_string())
