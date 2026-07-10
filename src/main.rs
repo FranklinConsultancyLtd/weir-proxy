@@ -34,5 +34,37 @@ async fn main() {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("weir listening on 0.0.0.0:8080");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+/// Waits for Ctrl+C or SIGTERM. Without this, Weir (running as PID 1 in a
+/// container with no init process) never installs a signal handler, so the
+/// kernel doesn't apply the default terminate action for either signal to
+/// PID 1 — Ctrl+C and `docker stop` are both silently ignored until the
+/// stop grace period expires and Docker escalates to SIGKILL.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl+C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
 }
