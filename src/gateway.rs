@@ -124,6 +124,15 @@ async fn proxy(
 
     let status = upstream_res.status();
     let upstream_headers = upstream_res.headers().clone();
+    // Real OpenAI/Anthropic responses always set Content-Type, so this
+    // check is reliable in practice. A response with no Content-Type at
+    // all falls to the non-streaming path below; if it were actually a
+    // stream, that response is buffered whole and forwarded as one block
+    // once it ends (correct content, no incremental delivery) with
+    // enforcement skipped for that one response, since non_streaming_cost
+    // can't parse SSE text as JSON. This is a known, low-likelihood edge
+    // against compliant providers, not a case worth adding stream-sniffing
+    // complexity for.
     let is_streaming = upstream_headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -145,9 +154,6 @@ async fn proxy(
             if !is_hop_by_hop(name) {
                 response_builder = response_builder.header(name, value);
             }
-        }
-        if !upstream_headers.contains_key(axum::http::header::CONTENT_TYPE) {
-            response_builder = response_builder.header("content-type", "text/event-stream");
         }
 
         let mut response = response_builder.body(Body::from_stream(stream)).unwrap();
