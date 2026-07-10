@@ -46,7 +46,7 @@ pub fn router(state: AppState) -> Router {
                 proxy(state, headers, method, path, body, Provider::Anthropic)
             }),
         )
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MiB: generous for vision/long-context payloads, but bounded
         .with_state(state)
 }
 
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_request_body_is_not_rejected_by_default_body_limit() {
+    async fn large_request_body_is_not_rejected_by_body_limit() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -291,7 +291,8 @@ mod tests {
         state.openai_base = mock.uri();
         let app = router(state);
 
-        // Larger than Axum's default 2MB request-body limit.
+        // Larger than Axum's default 2MB request-body limit, but comfortably
+        // under Weir's raised 100MiB cap (see `router()`).
         let large_body = vec![b'x'; 3 * 1024 * 1024];
         let response = app
             .oneshot(
@@ -308,7 +309,35 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "a request body larger than axum's default 2MB limit must not be rejected"
+            "a request body larger than axum's default 2MB limit, but under Weir's 100MiB cap, must not be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_exceeding_raised_cap_is_still_rejected() {
+        // Proves the raised limit is a bound, not a full disable: a body
+        // past the 100MiB cap must still be rejected with 413, before ever
+        // reaching a mock upstream.
+        let state = state_with_tenant("acct_1", 1000);
+        let app = router(state);
+
+        let oversized_body = vec![b'x'; 100 * 1024 * 1024 + 1];
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header(TENANT_HEADER, "acct_1")
+                    .body(AxumBody::from(oversized_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a request body larger than Weir's 100MiB cap must be rejected with 413"
         );
     }
 }
