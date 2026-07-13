@@ -36,6 +36,7 @@ pub trait ProviderAdapter: Send {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     OpenAi,
     Anthropic,
