@@ -202,8 +202,13 @@ the tool-calling loops that are exactly what Weir is designed to catch.
 `GET /events?since=<event_id>&limit=<n>` returns a cursor-paginated list
 of recent per-request usage events in JSON format. Each event contains
 metadata only — tenant ID, provider, model, tool names (if any), token
-count, a millisecond timestamp, and whether the request was blocked and
-why. Event payloads and tool arguments are never logged.
+count, a millisecond timestamp, and an `outcome` (`completed`,
+`budget_blocked`, `policy_blocked`, `upstream_error`, or `incomplete`)
+plus, for a policy block, the specific `rule` that fired (e.g.
+`blocked_tool:send_email`). Exactly one event is recorded per request on
+every terminal path — including `incomplete` when a streaming client
+disconnects before the response finished. Event payloads and tool
+arguments are never logged.
 
 ```bash
 curl http://localhost:8080/events?since=0&limit=100
@@ -216,6 +221,14 @@ has read them — so a consumer that polls infrequently may miss events that
 were evicted before it read them. This surface is designed for telemetry
 collection — e.g., metrics export or SaaS agent auditing — not for durable
 request tracking.
+
+> **Note:** `/events` is unauthenticated and returns metadata for *all*
+> tenants to anyone who can reach the port. This matches Weir's overall
+> trust model (it runs inside your own network and trusts the
+> `x-weir-tenant` header), but it means the endpoint must be kept on a
+> trusted network — bind it to a private interface or front it with
+> authentication before exposing it across a trust boundary (e.g. before a
+> hosted agent polls it).
 
 ## Development
 
