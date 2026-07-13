@@ -4,10 +4,17 @@ use futures::{Stream, StreamExt};
 
 use crate::budget::BudgetRegistry;
 use crate::error::WeirError;
-use crate::provider::ProviderAdapter;
+use crate::provider::{Provider, ProviderAdapter};
+use crate::telemetry::{EventLog, UsageEvent};
 
 const BUDGET_EXCEEDED_EVENT: &[u8] =
     b"event: error\ndata: {\"error\":\"budget_exceeded\"}\n\n";
+
+fn policy_violation_event(tool: &str) -> Bytes {
+    Bytes::from(format!(
+        "event: error\ndata: {{\"error\":\"policy_violation\",\"tool\":\"{tool}\"}}\n\n"
+    ))
+}
 
 /// Buffers raw upstream bytes and yields only complete SSE events (each
 /// terminated by a blank line, `"\n\n"`), retaining any trailing partial
@@ -28,9 +35,6 @@ impl SseFrameBuffer {
         Self { buf: Vec::new() }
     }
 
-    /// Appends `chunk` and returns any complete events now available (each
-    /// including its trailing blank-line separator). Retains any trailing
-    /// partial event in the buffer for the next call.
     fn push(&mut self, chunk: &[u8]) -> Vec<Bytes> {
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
@@ -41,10 +45,6 @@ impl SseFrameBuffer {
         events
     }
 
-    /// Called once the upstream stream ends. SSE streams should always end
-    /// with a blank line, but this is a best-effort flush of whatever's
-    /// left rather than silently dropping a final event that arrived
-    /// without a trailing separator.
     fn flush(&mut self) -> Option<Bytes> {
         if self.buf.is_empty() {
             None
@@ -54,99 +54,156 @@ impl SseFrameBuffer {
     }
 }
 
-/// Returns the byte offset just past the first `"\n\n"` in `buf`, if any.
 fn find_event_boundary(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
 }
 
 enum EventOutcome {
     Forward(Bytes),
-    Trip,
+    BudgetTrip,
+    PolicyTrip(String),
 }
 
-/// Computes one reassembled event's cost, records it against the tenant's
-/// budget, and decides whether it may be forwarded. Recording happens
-/// unconditionally before this function returns `Forward` — the caller
-/// must yield nothing beyond the terminal event for a `Trip` outcome.
-fn process_event(
-    event: &Bytes,
-    adapter: &mut dyn ProviderAdapter,
-    budget: &BudgetRegistry,
-    tenant: &str,
-    recorded_so_far: &mut u64,
-    now_ms: i64,
-) -> Result<EventOutcome, WeirError> {
-    let cost = adapter.chunk_cost(event);
+struct EventAccounting<'a> {
+    adapter: &'a mut dyn ProviderAdapter,
+    budget: &'a BudgetRegistry,
+    tenant: &'a str,
+    blocked_tools: &'a [String],
+    recorded_so_far: &'a mut u64,
+    tools_seen: &'a mut Vec<String>,
+}
+
+fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Result<EventOutcome, WeirError> {
+    let cost = acc.adapter.chunk_cost(event);
+
+    for tool in &cost.tool_calls {
+        if !acc.tools_seen.contains(tool) {
+            acc.tools_seen.push(tool.clone());
+        }
+        if acc.blocked_tools.contains(tool) {
+            return Ok(EventOutcome::PolicyTrip(tool.clone()));
+        }
+    }
+
     let delta = match cost.authoritative_total {
         Some(total) => {
-            let delta = total.saturating_sub(*recorded_so_far);
-            *recorded_so_far = total;
+            let delta = total.saturating_sub(*acc.recorded_so_far);
+            *acc.recorded_so_far = total;
             delta
         }
         None => {
-            *recorded_so_far += cost.estimated_tokens;
+            *acc.recorded_so_far += cost.estimated_tokens;
             cost.estimated_tokens
         }
     };
 
-    let within_budget = budget.record(tenant, delta, now_ms)?;
+    let within_budget = acc.budget.record(acc.tenant, delta, now_ms)?;
 
     Ok(if within_budget {
         EventOutcome::Forward(event.clone())
     } else {
-        EventOutcome::Trip
+        EventOutcome::BudgetTrip
     })
 }
 
 /// Wraps an upstream SSE byte stream, enforcing the tenant's token budget
-/// event by event. Raw upstream reads are first reassembled into complete
-/// SSE events (see `SseFrameBuffer`), so accounting and forwarding
-/// decisions are never made against a partial frame. Each event's cost is
-/// recorded against the budget BEFORE it is yielded; an event that would
-/// breach the ceiling is never forwarded. Instead, a terminal SSE error
-/// event is yielded and the stream ends.
+/// and tool policy event by event. Raw upstream reads are first
+/// reassembled into complete SSE events (see `SseFrameBuffer`), so
+/// accounting and forwarding decisions are never made against a partial
+/// frame. Each event's cost is recorded against the budget, and its tool
+/// calls checked against policy, BEFORE it is yielded; an event that would
+/// breach the budget or invoke a blocked tool is never forwarded — a
+/// terminal SSE error event is yielded instead and the stream ends. On
+/// completion (however it ends) exactly one `UsageEvent` is pushed to
+/// `event_log`.
+#[allow(clippy::too_many_arguments)]
 pub fn enforce(
     tenant: String,
+    provider: Provider,
+    model: Option<String>,
     mut upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
     mut adapter: Box<dyn ProviderAdapter>,
     budget: Arc<BudgetRegistry>,
+    blocked_tools: Vec<String>,
+    event_log: Arc<EventLog>,
     now_ms: impl Fn() -> i64 + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, WeirError>> {
     async_stream::stream! {
         let mut recorded_so_far: u64 = 0;
+        let mut tools_seen: Vec<String> = Vec::new();
         let mut frames = SseFrameBuffer::new();
+
+        macro_rules! emit_and_return {
+            ($blocked:expr, $reason:expr) => {{
+                event_log.push(UsageEvent {
+                    id: 0,
+                    tenant: tenant.clone(),
+                    provider,
+                    model: model.clone(),
+                    tools_called: tools_seen.clone(),
+                    tokens: recorded_so_far,
+                    blocked: $blocked,
+                    block_reason: $reason,
+                    timestamp_ms: now_ms(),
+                });
+                return;
+            }};
+        }
 
         while let Some(chunk_res) = upstream.next().await {
             let raw = match chunk_res {
                 Ok(raw) => raw,
                 Err(e) => {
                     yield Err(WeirError::Upstream(e));
-                    return;
+                    emit_and_return!(true, Some("upstream_error".to_string()));
                 }
             };
 
             for event in frames.push(&raw) {
-                match process_event(&event, adapter.as_mut(), &budget, &tenant, &mut recorded_so_far, now_ms()) {
+                let mut acc = EventAccounting {
+                    adapter: adapter.as_mut(),
+                    budget: &budget,
+                    tenant: &tenant,
+                    blocked_tools: &blocked_tools,
+                    recorded_so_far: &mut recorded_so_far,
+                    tools_seen: &mut tools_seen,
+                };
+                match process_event(&mut acc, &event, now_ms()) {
                     Ok(EventOutcome::Forward(bytes)) => yield Ok(bytes),
-                    Ok(EventOutcome::Trip) => {
+                    Ok(EventOutcome::BudgetTrip) => {
                         yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT));
-                        return;
+                        emit_and_return!(true, Some("budget_exceeded".to_string()));
+                    }
+                    Ok(EventOutcome::PolicyTrip(tool)) => {
+                        yield Ok(policy_violation_event(&tool));
+                        emit_and_return!(true, Some(format!("blocked_tool:{tool}")));
                     }
                     Err(e) => {
                         yield Err(e);
-                        return;
+                        emit_and_return!(true, Some("error".to_string()));
                     }
                 }
             }
         }
 
         if let Some(event) = frames.flush() {
-            match process_event(&event, adapter.as_mut(), &budget, &tenant, &mut recorded_so_far, now_ms()) {
+            let mut acc = EventAccounting {
+                adapter: adapter.as_mut(),
+                budget: &budget,
+                tenant: &tenant,
+                blocked_tools: &blocked_tools,
+                recorded_so_far: &mut recorded_so_far,
+                tools_seen: &mut tools_seen,
+            };
+            match process_event(&mut acc, &event, now_ms()) {
                 Ok(EventOutcome::Forward(bytes)) => yield Ok(bytes),
-                Ok(EventOutcome::Trip) => yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT)),
+                Ok(EventOutcome::BudgetTrip) => yield Ok(Bytes::from_static(BUDGET_EXCEEDED_EVENT)),
+                Ok(EventOutcome::PolicyTrip(tool)) => yield Ok(policy_violation_event(&tool)),
                 Err(e) => yield Err(e),
             }
         }
+
+        emit_and_return!(false, None);
     }
 }
 
@@ -155,6 +212,7 @@ mod tests {
     use super::*;
     use crate::config::{BudgetLimit, ParsedConfig, TenantLimits};
     use crate::provider::{ChunkCost, OpenAiAdapter, ProviderAdapter};
+    use crate::telemetry::EventLog;
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -165,11 +223,11 @@ mod tests {
 
     impl ProviderAdapter for FixedCostAdapter {
         fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
-            ChunkCost { estimated_tokens: self.cost_per_chunk, authoritative_total: None }
+            ChunkCost { estimated_tokens: self.cost_per_chunk, authoritative_total: None, tool_calls: Vec::new() }
         }
 
-        fn non_streaming_cost(&self, _body: &Bytes) -> Option<u64> {
-            None
+        fn non_streaming_cost(&self, _body: &Bytes) -> crate::provider::NonStreamingCost {
+            crate::provider::NonStreamingCost { total_tokens: None, tool_calls: Vec::new() }
         }
     }
 
@@ -180,11 +238,11 @@ mod tests {
     impl ProviderAdapter for AuthoritativeCostAdapter {
         fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
             let total = self.totals.pop_front().unwrap_or(0);
-            ChunkCost { estimated_tokens: 0, authoritative_total: Some(total) }
+            ChunkCost { estimated_tokens: 0, authoritative_total: Some(total), tool_calls: Vec::new() }
         }
 
-        fn non_streaming_cost(&self, _body: &Bytes) -> Option<u64> {
-            None
+        fn non_streaming_cost(&self, _body: &Bytes) -> crate::provider::NonStreamingCost {
+            crate::provider::NonStreamingCost { total_tokens: None, tool_calls: Vec::new() }
         }
     }
 
@@ -207,9 +265,19 @@ mod tests {
         let adapter: Box<dyn ProviderAdapter> = Box::new(FixedCostAdapter { cost_per_chunk: 10 });
         let budget = budget_with("acct_1", 1000);
 
-        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
-            .collect()
-            .await;
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            None,
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            Arc::new(EventLog::new(100)),
+            || 0,
+        )
+        .collect()
+        .await;
 
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|r| r.is_ok()));
@@ -225,9 +293,19 @@ mod tests {
         let adapter: Box<dyn ProviderAdapter> = Box::new(FixedCostAdapter { cost_per_chunk: 10 });
         let budget = budget_with("acct_1", 15);
 
-        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
-            .collect()
-            .await;
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            None,
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            Arc::new(EventLog::new(100)),
+            || 0,
+        )
+        .collect()
+        .await;
 
         assert_eq!(out.len(), 2, "chunk1 forwarded, then trip event — chunk3 never reached");
         assert_eq!(out[0].as_ref().unwrap(), &Bytes::from_static(b"chunk1\n\n"));
@@ -247,9 +325,19 @@ mod tests {
         });
         let budget = budget_with("acct_1", 100);
 
-        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
-            .collect()
-            .await;
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            None,
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            Arc::new(EventLog::new(100)),
+            || 0,
+        )
+        .collect()
+        .await;
 
         // Chunk1 reports total=30 (delta 30, recorded=30). Chunk2 reports
         // total=70 (delta 40, recorded=70). Chunk3 reports the SAME total=70
@@ -280,9 +368,19 @@ mod tests {
         let adapter: Box<dyn ProviderAdapter> = Box::new(OpenAiAdapter::new(tokenizer));
         let budget = budget_with("acct_1", 1000);
 
-        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
-            .collect()
-            .await;
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            None,
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            Arc::new(EventLog::new(100)),
+            || 0,
+        )
+        .collect()
+        .await;
 
         assert_eq!(out.len(), 1, "the two raw chunks reassemble into exactly one complete event");
         let forwarded = out[0].as_ref().unwrap();
@@ -305,15 +403,102 @@ mod tests {
         let adapter: Box<dyn ProviderAdapter> = Box::new(FixedCostAdapter { cost_per_chunk: 10 });
         let budget = budget_with("acct_1", 1000);
 
-        let out: Vec<_> = enforce("acct_1".into(), upstream, adapter, budget, || 0)
-            .collect()
-            .await;
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            None,
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            Arc::new(EventLog::new(100)),
+            || 0,
+        )
+        .collect()
+        .await;
 
         assert_eq!(
             out.len(),
             2,
             "one raw chunk containing two SSE events must yield two forwarded events"
         );
+    }
+
+    #[tokio::test]
+    async fn trips_on_blocked_tool_and_never_forwards_it() {
+        struct ToolCallAdapter;
+        impl ProviderAdapter for ToolCallAdapter {
+            fn chunk_cost(&mut self, _raw: &Bytes) -> ChunkCost {
+                ChunkCost {
+                    estimated_tokens: 1,
+                    authoritative_total: None,
+                    tool_calls: vec!["send_email".to_string()],
+                }
+            }
+            fn non_streaming_cost(&self, _body: &Bytes) -> crate::provider::NonStreamingCost {
+                crate::provider::NonStreamingCost { total_tokens: None, tool_calls: Vec::new() }
+            }
+        }
+
+        let upstream = futures::stream::iter(vec![Ok(Bytes::from_static(b"chunk1\n\n"))]);
+        let adapter: Box<dyn ProviderAdapter> = Box::new(ToolCallAdapter);
+        let budget = budget_with("acct_1", 1000); // plenty of budget — this must trip on policy, not budget
+        let event_log = Arc::new(EventLog::new(100));
+
+        let out: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            Some("gpt-4o-mini".to_string()),
+            upstream,
+            adapter,
+            budget,
+            vec!["send_email".to_string()],
+            event_log.clone(),
+            || 0,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(out.len(), 1);
+        let event = out[0].as_ref().unwrap();
+        assert!(String::from_utf8_lossy(event).contains("policy_violation"));
+
+        let events = event_log.since(0, 10);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].blocked);
+        assert_eq!(events[0].block_reason.as_deref(), Some("blocked_tool:send_email"));
+        assert_eq!(events[0].tools_called, vec!["send_email".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn successful_stream_emits_one_unblocked_usage_event() {
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"chunk1\n\n")),
+            Ok(Bytes::from_static(b"chunk2\n\n")),
+        ]);
+        let adapter: Box<dyn ProviderAdapter> = Box::new(FixedCostAdapter { cost_per_chunk: 10 });
+        let budget = budget_with("acct_1", 1000);
+        let event_log = Arc::new(EventLog::new(100));
+
+        let _: Vec<_> = enforce(
+            "acct_1".into(),
+            Provider::OpenAi,
+            Some("gpt-4o-mini".to_string()),
+            upstream,
+            adapter,
+            budget,
+            Vec::new(),
+            event_log.clone(),
+            || 0,
+        )
+        .collect()
+        .await;
+
+        let events = event_log.since(0, 10);
+        assert_eq!(events.len(), 1, "exactly one UsageEvent per completed stream, not one per chunk");
+        assert!(!events[0].blocked);
+        assert_eq!(events[0].tokens, 20);
+        assert_eq!(events[0].model.as_deref(), Some("gpt-4o-mini"));
     }
 
     mod sse_frame_buffer_tests {
