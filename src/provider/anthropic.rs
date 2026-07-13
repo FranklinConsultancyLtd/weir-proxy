@@ -212,7 +212,7 @@ mod tests {
         let body = Bytes::from_static(
             b"{\"content\":[{\"type\":\"text\",\"text\":\"Hi\"}],\"usage\":{\"input_tokens\":25,\"output_tokens\":15}}",
         );
-        assert_eq!(adapter.non_streaming_cost(&body), Some(40));
+        assert_eq!(adapter.non_streaming_cost(&body).total_tokens, Some(40));
     }
 
     #[test]
