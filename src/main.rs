@@ -6,6 +6,7 @@ use weir::budget::BudgetRegistry;
 use weir::config;
 use weir::gateway::{router, AppState};
 use weir::provider::Tokenizer;
+use weir::telemetry::EventLog;
 
 #[tokio::main]
 async fn main() {
@@ -14,6 +15,11 @@ async fn main() {
     let config_path = env::var("WEIR_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("weir.toml"));
+
+    let event_log_capacity: usize = env::var("WEIR_EVENT_LOG_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
 
     let shared_config = config::load_shared(&config_path)
         .unwrap_or_else(|e| panic!("failed to load config at {}: {e}", config_path.display()));
@@ -29,6 +35,7 @@ async fn main() {
             .unwrap_or_else(|_| "https://api.openai.com".to_string()),
         anthropic_base: env::var("WEIR_ANTHROPIC_BASE")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+        events: Arc::new(EventLog::new(event_log_capacity)),
     };
 
     let app = router(state);
