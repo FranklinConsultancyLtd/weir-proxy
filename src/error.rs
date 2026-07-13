@@ -12,6 +12,8 @@ pub enum WeirError {
     Upstream(#[from] reqwest::Error),
     #[error("invalid configuration: {0}")]
     Config(String),
+    #[error("tenant '{tenant}' violated policy: {reason}")]
+    PolicyViolation { tenant: String, reason: String },
 }
 
 #[derive(Serialize)]
@@ -27,6 +29,7 @@ impl IntoResponse for WeirError {
             WeirError::UnknownTenant => (StatusCode::UNAUTHORIZED, "unknown_tenant"),
             WeirError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             WeirError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
+            WeirError::PolicyViolation { .. } => (StatusCode::FORBIDDEN, "policy_violation"),
         };
         let body = ErrorBody { error: code, message: self.to_string() };
         (status, axum::Json(body)).into_response()
@@ -47,5 +50,15 @@ mod tests {
     fn unknown_tenant_maps_to_401() {
         let response = WeirError::UnknownTenant.into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn policy_violation_maps_to_403() {
+        let response = WeirError::PolicyViolation {
+            tenant: "acct_1".into(),
+            reason: "blocked_tool: send_email".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
