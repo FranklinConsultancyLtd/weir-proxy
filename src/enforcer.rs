@@ -153,7 +153,7 @@ pub fn enforce(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BudgetLimit, TenantLimits};
+    use crate::config::{BudgetLimit, ParsedConfig, TenantLimits};
     use crate::provider::{ChunkCost, OpenAiAdapter, ProviderAdapter};
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
@@ -194,7 +194,8 @@ mod tests {
             tenant.to_string(),
             BudgetLimit { max_tokens, window: Duration::from_secs(60) },
         );
-        Arc::new(BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(limits))))
+        let parsed = ParsedConfig { limits, policies: HashMap::new() };
+        Arc::new(BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(parsed))))
     }
 
     #[tokio::test]

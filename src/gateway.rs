@@ -211,7 +211,7 @@ fn with_connection_close(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BudgetLimit, TenantLimits};
+    use crate::config::{BudgetLimit, ParsedConfig, TenantLimits};
     use arc_swap::ArcSwap;
     use axum::body::Body as AxumBody;
     use axum::http::Request;
@@ -225,8 +225,9 @@ mod tests {
             tenant.to_string(),
             BudgetLimit { max_tokens, window: Duration::from_secs(60) },
         );
+        let parsed = ParsedConfig { limits, policies: HashMap::new() };
         AppState {
-            budget: Arc::new(BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(limits)))),
+            budget: Arc::new(BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(parsed)))),
             tokenizer: Arc::new(Tokenizer::load()),
             http: reqwest::Client::new(),
             openai_base: "http://127.0.0.1:1".into(), // unreachable on purpose for this test

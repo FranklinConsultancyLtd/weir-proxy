@@ -1,39 +1,50 @@
 pub mod sliding_window;
 
 use std::sync::Arc;
-use std::time::Duration;
-use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
-use crate::config::{BudgetLimit, TenantLimits};
+use crate::config::{BudgetLimit, PolicyConfig, SharedConfig};
 use crate::error::WeirError;
 use sliding_window::SlidingWindowCounter;
 
 pub struct BudgetRegistry {
-    limits: Arc<ArcSwap<TenantLimits>>,
+    config: SharedConfig,
     // Tracks the window each tenant's counter was created with, so a
     // config reload that changes a tenant's window recreates the counter
     // instead of silently running it against a stale window forever.
-    counters: DashMap<String, (Duration, Arc<SlidingWindowCounter>)>,
+    counters: DashMap<String, (std::time::Duration, Arc<SlidingWindowCounter>)>,
 }
 
 impl BudgetRegistry {
-    pub fn new(limits: Arc<ArcSwap<TenantLimits>>) -> Self {
-        Self { limits, counters: DashMap::new() }
+    pub fn new(config: SharedConfig) -> Self {
+        Self { config, counters: DashMap::new() }
     }
 
     fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, WeirError> {
-        self.limits
+        self.config
             .load()
+            .limits
             .get(tenant)
             .copied()
             .ok_or(WeirError::UnknownTenant)
     }
 
+    /// Returns the tenant's configured policy (blocked models/tools). An
+    /// unknown tenant is the same error `limit_for` returns for the same
+    /// reason — both are reading the same underlying config snapshot.
+    pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, WeirError> {
+        self.config
+            .load()
+            .policies
+            .get(tenant)
+            .cloned()
+            .ok_or(WeirError::UnknownTenant)
+    }
+
+    // Fast path: try a borrowed lookup first to avoid allocating an
+    // owned `String` key on every call — this runs on the hot path,
+    // once per SSE event, not once per request.
     fn counter_for(&self, tenant: &str, limit: BudgetLimit) -> Arc<SlidingWindowCounter> {
-        // Fast path: try a borrowed lookup first to avoid allocating an
-        // owned `String` key on every call — this runs on the hot path,
-        // once per SSE event, not once per request.
         if let Some(existing) = self.counters.get(tenant) {
             if existing.0 == limit.window {
                 return existing.1.clone();
@@ -81,6 +92,9 @@ impl BudgetRegistry {
 mod registry_tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use arc_swap::ArcSwap;
+    use crate::config::ParsedConfig;
 
     fn registry_with(tenant: &str, max_tokens: u64, window_secs: u64) -> BudgetRegistry {
         let mut limits = HashMap::new();
@@ -88,7 +102,8 @@ mod registry_tests {
             tenant.to_string(),
             BudgetLimit { max_tokens, window: Duration::from_secs(window_secs) },
         );
-        BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(limits)))
+        let parsed = ParsedConfig { limits, policies: HashMap::new() };
+        BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(parsed)))
     }
 
     #[test]
@@ -121,7 +136,8 @@ mod registry_tests {
             tenant.to_string(),
             BudgetLimit { max_tokens: 100, window: Duration::from_secs(60) },
         );
-        let shared = Arc::new(ArcSwap::from_pointee(limits));
+        let parsed = ParsedConfig { limits, policies: HashMap::new() };
+        let shared = Arc::new(ArcSwap::from_pointee(parsed));
         let registry = BudgetRegistry::new(shared.clone());
 
         registry.record(tenant, 50, 0).unwrap();
@@ -134,10 +150,36 @@ mod registry_tests {
             tenant.to_string(),
             BudgetLimit { max_tokens: 100, window: Duration::from_secs(120) },
         );
-        shared.store(Arc::new(new_limits));
+        let new_parsed = ParsedConfig { limits: new_limits, policies: HashMap::new() };
+        shared.store(Arc::new(new_parsed));
 
         // Usage resets because the window changed — old accumulated state
         // doesn't cleanly carry over to a differently-sized window.
         assert!(registry.record(tenant, 100, 0).unwrap()); // fresh counter: 100 <= 100 ok
+    }
+
+    #[test]
+    fn policy_for_returns_configured_policy() {
+        let mut limits = HashMap::new();
+        limits.insert(
+            "acct_1".to_string(),
+            BudgetLimit { max_tokens: 100, window: Duration::from_secs(60) },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "acct_1".to_string(),
+            PolicyConfig {
+                blocked_models: vec!["gpt-3.5-turbo".to_string()],
+                blocked_tools: vec!["send_email".to_string()],
+            },
+        );
+        let parsed = ParsedConfig { limits, policies };
+        let registry = BudgetRegistry::new(Arc::new(ArcSwap::from_pointee(parsed)));
+
+        let policy = registry.policy_for("acct_1").unwrap();
+        assert_eq!(policy.blocked_models, vec!["gpt-3.5-turbo".to_string()]);
+        assert_eq!(policy.blocked_tools, vec!["send_email".to_string()]);
+
+        assert!(matches!(registry.policy_for("acct_unknown"), Err(WeirError::UnknownTenant)));
     }
 }
