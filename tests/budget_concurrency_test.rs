@@ -14,8 +14,9 @@ async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
         "acct_1".to_string(),
         BudgetLimit { max_tokens: ceiling, window: Duration::from_secs(60) },
     );
+    let parsed = weir::config::ParsedConfig { limits, policies: HashMap::new() };
     let registry = Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(
-        limits,
+        parsed,
     ))));
 
     let chunk_cost = 50u64;
