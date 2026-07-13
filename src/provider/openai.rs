@@ -3,7 +3,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use tiktoken_rs::CoreBPE;
 
-use crate::provider::{ChunkCost, ProviderAdapter};
+use crate::provider::{ChunkCost, NonStreamingCost, ProviderAdapter};
 
 pub struct OpenAiAdapter {
     tokenizer: Arc<CoreBPE>,
@@ -55,6 +55,7 @@ impl ProviderAdapter for OpenAiAdapter {
     fn chunk_cost(&mut self, raw: &Bytes) -> ChunkCost {
         let mut estimated_tokens = 0u64;
         let mut authoritative_total = None;
+        let mut tool_calls = Vec::new();
         let text = String::from_utf8_lossy(raw);
 
         for line in text.lines() {
@@ -72,6 +73,7 @@ impl ProviderAdapter for OpenAiAdapter {
                     let Some(function) = &tool_call.function else { continue };
                     if let Some(name) = &function.name {
                         estimated_tokens += self.tokenizer.encode_ordinary(name).len() as u64;
+                        tool_calls.push(name.clone());
                     }
                     if let Some(arguments) = &function.arguments {
                         estimated_tokens += self.tokenizer.encode_ordinary(arguments).len() as u64;
@@ -83,16 +85,43 @@ impl ProviderAdapter for OpenAiAdapter {
             }
         }
 
-        ChunkCost { estimated_tokens, authoritative_total }
+        ChunkCost { estimated_tokens, authoritative_total, tool_calls }
     }
 
-    fn non_streaming_cost(&self, body: &Bytes) -> Option<u64> {
+    fn non_streaming_cost(&self, body: &Bytes) -> NonStreamingCost {
+        #[derive(Deserialize, Default)]
+        struct NonStreamingMessage {
+            #[serde(default)]
+            tool_calls: Vec<OpenAiToolCallDelta>,
+        }
+        #[derive(Deserialize, Default)]
+        struct NonStreamingChoice {
+            #[serde(default)]
+            message: NonStreamingMessage,
+        }
         #[derive(Deserialize)]
         struct NonStreamingResponse {
+            #[serde(default)]
+            choices: Vec<NonStreamingChoice>,
             usage: Option<OpenAiUsage>,
         }
-        let parsed: NonStreamingResponse = serde_json::from_slice(body).ok()?;
-        parsed.usage.map(|u| u.total_tokens)
+
+        let Ok(parsed) = serde_json::from_slice::<NonStreamingResponse>(body) else {
+            return NonStreamingCost { total_tokens: None, tool_calls: Vec::new() };
+        };
+
+        let mut tool_calls = Vec::new();
+        for choice in &parsed.choices {
+            for tool_call in &choice.message.tool_calls {
+                if let Some(function) = &tool_call.function {
+                    if let Some(name) = &function.name {
+                        tool_calls.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        NonStreamingCost { total_tokens: parsed.usage.map(|u| u.total_tokens), tool_calls }
     }
 }
 
@@ -189,13 +218,34 @@ mod tests {
         let body = Bytes::from_static(
             b"{\"choices\":[{\"message\":{\"content\":\"Hi\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
         );
-        assert_eq!(adapter.non_streaming_cost(&body), Some(7));
+        assert_eq!(adapter.non_streaming_cost(&body).total_tokens, Some(7));
     }
 
     #[test]
     fn non_streaming_cost_returns_none_for_unparseable_body() {
         let adapter = OpenAiAdapter::new(tokenizer());
         let body = Bytes::from_static(b"not json at all");
-        assert_eq!(adapter.non_streaming_cost(&body), None);
+        assert_eq!(adapter.non_streaming_cost(&body).total_tokens, None);
+    }
+
+    #[test]
+    fn chunk_cost_reports_tool_call_names() {
+        let mut adapter = OpenAiAdapter::new(tokenizer());
+        let raw = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        let cost = adapter.chunk_cost(&raw);
+        assert_eq!(cost.tool_calls, vec!["get_weather".to_string()]);
+    }
+
+    #[test]
+    fn non_streaming_cost_reports_tool_call_names() {
+        let adapter = OpenAiAdapter::new(tokenizer());
+        let body = Bytes::from_static(
+            b"{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
+        );
+        let cost = adapter.non_streaming_cost(&body);
+        assert_eq!(cost.tool_calls, vec!["get_weather".to_string()]);
+        assert_eq!(cost.total_tokens, Some(7));
     }
 }
