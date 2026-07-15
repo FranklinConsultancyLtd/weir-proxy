@@ -1,12 +1,12 @@
-# Weir `/events` generation ID Implementation Plan
+# SymFynity `/events` generation ID Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a per-process `generation` identifier to Weir and wrap the `/events` response as `{ "generation": "<id>", "events": [ ... ] }`, so a downstream consumer (weir-agent) can detect a Weir restart and reset its cursor instead of silently stalling.
+**Goal:** Add a per-process `generation` identifier to SymFynity and wrap the `/events` response as `{ "generation": "<id>", "events": [ ... ] }`, so a downstream consumer (symfynity-agent) can detect a SymFynity restart and reset its cursor instead of silently stalling.
 
-**Architecture:** Weir's `/events` cursor (`UsageEvent.id`) is monotonic per process — `EventLog.next_id` resets to 1 on every restart. A consumer persisting a cursor would miss all events after a restart. Fix: generate a `generation` string once at startup (stable for the process, changes on restart), carry it in `AppState`, and include it in the `/events` response object. This is a breaking change to the `/events` response shape, but weir-agent (its first real consumer) does not exist yet, so nothing deployed depends on the old shape.
+**Architecture:** SymFynity's `/events` cursor (`UsageEvent.id`) is monotonic per process — `EventLog.next_id` resets to 1 on every restart. A consumer persisting a cursor would miss all events after a restart. Fix: generate a `generation` string once at startup (stable for the process, changes on restart), carry it in `AppState`, and include it in the `/events` response object. This is a breaking change to the `/events` response shape, but symfynity-agent (its first real consumer) does not exist yet, so nothing deployed depends on the old shape.
 
-**Tech Stack:** Existing Weir stack — Rust, Axum, Tokio, serde. No new dependency (generation is the process start time in nanoseconds since the epoch, as a string — dependency-free and changes on every restart).
+**Tech Stack:** Existing SymFynity stack — Rust, Axum, Tokio, serde. No new dependency (generation is the process start time in nanoseconds since the epoch, as a string — dependency-free and changes on every restart).
 
 ## Global Constraints
 
@@ -19,7 +19,7 @@
 ## File Structure
 
 ```
-weir-proxy/
+symfynity-proxy/
 ├── src/
 │   ├── telemetry.rs   (add EventsResponse struct)
 │   ├── gateway.rs     (AppState.generation; events_handler returns EventsResponse; test helpers + /events test)
@@ -50,7 +50,7 @@ Read `src/telemetry.rs` first. After the `UsageEvent` struct, add:
 
 ```rust
 /// The `/events` HTTP response envelope. `generation` is a per-process
-/// identifier that changes whenever Weir restarts, so a polling consumer
+/// identifier that changes whenever SymFynity restarts, so a polling consumer
 /// can detect a restart (its persisted cursor is only meaningful within a
 /// single generation, since `UsageEvent.id` resets to 1 each process).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,7 +68,7 @@ Read `src/gateway.rs` first.
 ```rust
     pub events: Arc<EventLog>,
     /// Per-process identifier included in the `/events` response so a
-    /// consumer can detect a Weir restart (see EventsResponse).
+    /// consumer can detect a SymFynity restart (see EventsResponse).
     pub generation: String,
 ```
 
@@ -117,7 +117,7 @@ Add `generation,` as a field in the `AppState { ... }` literal (alongside `event
 
 Read `tests/proxy_flow_test.rs` first. Two changes:
 - Every `AppState { ... }` construction (the `state_pointed_at` helper and any inline construction in the tests) needs `generation: "test-generation".to_string(),` added.
-- The `events_endpoint_reflects_a_completed_request` test parses `Vec<weir::telemetry::UsageEvent>` from the `/events` body — change it to parse `weir::telemetry::EventsResponse` and assert against `.events` (and optionally `.generation == "test-generation"`), matching the gateway unit test pattern.
+- The `events_endpoint_reflects_a_completed_request` test parses `Vec<symfynity::telemetry::UsageEvent>` from the `/events` body — change it to parse `symfynity::telemetry::EventsResponse` and assert against `.events` (and optionally `.generation == "test-generation"`), matching the gateway unit test pattern.
 
 - [ ] **Step 5: Update the README `/events` section**
 
@@ -125,10 +125,10 @@ Read the `Telemetry` / `/events` section of `README.md`. Update it to show the r
 
 > `GET /events?since=<event_id>&limit=<n>` returns a JSON object
 > `{ "generation": "<id>", "events": [ ... ] }`. `generation` is a
-> per-process identifier that changes whenever Weir restarts — a consumer
+> per-process identifier that changes whenever SymFynity restarts — a consumer
 > that persists a cursor should treat the cursor as valid only within a
 > single generation and reset it (to 0) when the generation changes, since
-> event ids restart at 1 on each Weir process. Each event in `events`
+> event ids restart at 1 on each SymFynity process. Each event in `events`
 > contains [existing field description].
 
 Keep the rest of the section (fields, ring-buffer note, the unauthenticated-endpoint security note) intact; only the response-shape description changes.
@@ -149,7 +149,7 @@ git commit -m "feat: wrap /events in a per-process generation envelope
 
 Adds a startup-generated `generation` id and changes the /events response
 from a bare array to { generation, events }, so a polling consumer can
-detect a Weir restart (event ids reset per process) and reset its cursor
+detect a SymFynity restart (event ids reset per process) and reset its cursor
 instead of silently missing all events from the restarted process."
 ```
 
@@ -157,6 +157,6 @@ instead of silently missing all events from the restarted process."
 
 ## Self-Review Notes
 
-- **Spec coverage:** implements the "Prerequisite: a small change to Weir" section of the weir-agent design spec — startup `generation`, `{generation, events}` response shape, tests + README updated.
+- **Spec coverage:** implements the "Prerequisite: a small change to SymFynity" section of the symfynity-agent design spec — startup `generation`, `{generation, events}` response shape, tests + README updated.
 - **Type consistency:** `EventsResponse` defined once in `telemetry.rs`, consumed by the gateway handler (Serialize) and both `/events` tests (Deserialize). `AppState.generation: String` set in `main.rs` (real) and the test helpers (`"test-generation"`).
 - **No intermediate broken state:** unlike the prior policy+telemetry plan, this is a single cohesive task; the crate compiles and the full suite passes at the end of Task 1.

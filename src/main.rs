@@ -2,21 +2,21 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use weir::budget::BudgetRegistry;
-use weir::config;
-use weir::gateway::{router, AppState};
-use weir::provider::Tokenizer;
-use weir::telemetry::EventLog;
+use symfynity::budget::BudgetRegistry;
+use symfynity::config;
+use symfynity::gateway::{router, AppState};
+use symfynity::provider::Tokenizer;
+use symfynity::telemetry::EventLog;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config_path = env::var("WEIR_CONFIG")
+    let config_path = env::var("SYMFYNITY_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("weir.toml"));
+        .unwrap_or_else(|_| PathBuf::from("symfynity.toml"));
 
-    let event_log_capacity: usize = env::var("WEIR_EVENT_LOG_CAPACITY")
+    let event_log_capacity: usize = env::var("SYMFYNITY_EVENT_LOG_CAPACITY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
@@ -36,9 +36,9 @@ async fn main() {
         budget: Arc::new(BudgetRegistry::new(shared_config)),
         tokenizer: Arc::new(Tokenizer::load()),
         http: reqwest::Client::new(),
-        openai_base: env::var("WEIR_OPENAI_BASE")
+        openai_base: env::var("SYMFYNITY_OPENAI_BASE")
             .unwrap_or_else(|_| "https://api.openai.com".to_string()),
-        anthropic_base: env::var("WEIR_ANTHROPIC_BASE")
+        anthropic_base: env::var("SYMFYNITY_ANTHROPIC_BASE")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
         events: Arc::new(EventLog::new(event_log_capacity)),
         generation,
@@ -46,14 +46,14 @@ async fn main() {
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    tracing::info!("weir listening on 0.0.0.0:8080");
+    tracing::info!("symfynity listening on 0.0.0.0:8080");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
 }
 
-/// Waits for Ctrl+C or SIGTERM. Without this, Weir (running as PID 1 in a
+/// Waits for Ctrl+C or SIGTERM. Without this, SymFynity (running as PID 1 in a
 /// container with no init process) never installs a signal handler, so the
 /// kernel doesn't apply the default terminate action for either signal to
 /// PID 1 — Ctrl+C and `docker stop` are both silently ignored until the

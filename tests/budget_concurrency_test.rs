@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use weir::budget::BudgetRegistry;
-use weir::config::{BudgetLimit, TenantLimits};
+use symfynity::budget::BudgetRegistry;
+use symfynity::config::{BudgetLimit, TenantLimits};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
@@ -14,7 +14,7 @@ async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
         "acct_1".to_string(),
         BudgetLimit { max_tokens: ceiling, window: Duration::from_secs(60) },
     );
-    let parsed = weir::config::ParsedConfig { limits, policies: HashMap::new() };
+    let parsed = symfynity::config::ParsedConfig { limits, policies: HashMap::new() };
     let registry = Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(
         parsed,
     ))));

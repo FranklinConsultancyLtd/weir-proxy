@@ -1,8 +1,8 @@
-# Releasing Weir
+# Releasing SymFynity
 
 ## Licence checks — read before every release
 
-Weir is licensed under the Business Source License 1.1 (see [`LICENSE`](LICENSE)).
+SymFynity is licensed under the Business Source License 1.1 (see [`LICENSE`](LICENSE)).
 BSL has a small number of ways to go quietly wrong at release time. None of them
 error; they all just silently give away more than intended.
 
@@ -33,18 +33,21 @@ what's intended.
 ### Do not bump `Licensed Work` per release
 
 ```
-Licensed Work:        Weir Version 0.2.0 or later.
+Licensed Work:        SymFynity Version 0.3.0 or later.
 ```
 
 The `or later` covers all future versions. This line changes only if the
-licensing policy itself changes — e.g. a future version moves to different terms.
-It is not a version-bump chore.
+licensing policy itself changes — e.g. a future version moves to different terms,
+or the Licensed Work is renamed. It is not a version-bump chore.
+
+It has changed exactly once, at 0.3.0, when the proxy was renamed from Weir to
+SymFynity. That is the bar: a change of identity or terms, not a release.
 
 ### Bump the copyright year in January
 
 ```
-Licensed Work:        Weir Version 0.2.0 or later. The Licensed Work is (c) 2026
-                      SYMFYNITY LIMITED.
+Licensed Work:        SymFynity Version 0.3.0 or later. The Licensed Work is
+                      (c) 2026 SYMFYNITY LIMITED.
 ```
 
 Stale years are cosmetic, not fatal — but they are the first thing a reviewing
@@ -55,17 +58,17 @@ solicitor notices.
 BSL: *"You must conspicuously display this License on each original or modified
 copy of the Licensed Work."* A published binary or image is a copy.
 
-- Docker image — `Dockerfile` copies `LICENSE` to `/usr/local/share/weir/LICENSE`.
+- Docker image — `Dockerfile` copies `LICENSE` to `/usr/local/share/symfynity/LICENSE`.
   Verify after any Dockerfile restructure:
   ```bash
-  docker run --rm --entrypoint cat <image> /usr/local/share/weir/LICENSE | head -3
+  docker run --rm --entrypoint cat <image> /usr/local/share/symfynity/LICENSE | head -3
   ```
 - Any new distribution channel (tarball, crates.io, package repo) needs the same
   check before it is used for the first time.
 
 ### Check new dependency licences
 
-Weir is distributed as a compiled binary, so a copyleft dependency pulled into
+SymFynity is distributed as a compiled binary, so a copyleft dependency pulled into
 the tree becomes a licensing problem for the whole artifact — BSL does not
 override an upstream GPL obligation. Worth a look whenever `Cargo.lock` gains
 entries:
@@ -76,14 +79,20 @@ cargo tree --format '{p} {l}' | grep -viE 'MIT|Apache-2.0|BSD|ISC|Unicode|Zlib' 
 
 ## Version history and licensing
 
-| Version | Licence |
-|---|---|
-| 0.1.0 | Apache License 2.0 |
-| 0.2.0 onward | Business Source License 1.1 → Apache-2.0 after four years |
+| Version | Published as | Licence |
+|---|---|---|
+| 0.1.0 | Weir | Apache License 2.0 |
+| 0.2.0 | Weir | Business Source License 1.1 |
+| 0.3.0 onward | SymFynity | Business Source License 1.1 → Apache-2.0 after four years |
 
-Weir 0.1.0 was published publicly under Apache-2.0. Those terms are irrevocable
-for that version and anyone who obtained it — that is expected and fine, not a
-leak to be plugged. The line simply sits between 0.1.0 and 0.2.0.
+Both earlier versions were published publicly under the name Weir, and 0.1.0 under
+Apache-2.0. Those terms are irrevocable for that version and anyone who obtained
+it — that is expected and fine, not a leak to be plugged. The licence line sits
+between 0.1.0 and 0.2.0; the name line sits between 0.2.0 and 0.3.0.
+
+Neither is worth rewriting history over. A published version keeps the name and
+the terms it was published under, permanently, and any record that says otherwise
+is simply wrong rather than helpfully tidy.
 
 ## If the licence is ever changed again
 

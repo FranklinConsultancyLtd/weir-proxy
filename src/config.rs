@@ -5,7 +5,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetLimit {
@@ -49,9 +49,9 @@ struct RawPolicy {
     blocked_tools: Vec<String>,
 }
 
-pub fn parse(contents: &str) -> Result<ParsedConfig, WeirError> {
+pub fn parse(contents: &str) -> Result<ParsedConfig, SymfynityError> {
     let raw: RawConfig =
-        toml::from_str(contents).map_err(|e| WeirError::Config(e.to_string()))?;
+        toml::from_str(contents).map_err(|e| SymfynityError::Config(e.to_string()))?;
 
     let mut limits = TenantLimits::new();
     let mut policies = TenantPolicies::new();
@@ -76,9 +76,9 @@ pub fn parse(contents: &str) -> Result<ParsedConfig, WeirError> {
     Ok(ParsedConfig { limits, policies })
 }
 
-pub fn load_from_file(path: &Path) -> Result<ParsedConfig, WeirError> {
+pub fn load_from_file(path: &Path) -> Result<ParsedConfig, SymfynityError> {
     let contents = std::fs::read_to_string(path)
-        .map_err(|e| WeirError::Config(format!("reading {}: {e}", path.display())))?;
+        .map_err(|e| SymfynityError::Config(format!("reading {}: {e}", path.display())))?;
     parse(&contents)
 }
 
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn rejects_malformed_toml() {
         let result = parse("not valid toml {{{");
-        assert!(matches!(result, Err(WeirError::Config(_))));
+        assert!(matches!(result, Err(SymfynityError::Config(_))));
     }
 
     #[test]
@@ -138,7 +138,7 @@ mod tests {
 
 pub type SharedConfig = Arc<ArcSwap<ParsedConfig>>;
 
-pub fn load_shared(path: &Path) -> Result<SharedConfig, WeirError> {
+pub fn load_shared(path: &Path) -> Result<SharedConfig, SymfynityError> {
     let parsed = load_from_file(path)?;
     Ok(Arc::new(ArcSwap::from_pointee(parsed)))
 }

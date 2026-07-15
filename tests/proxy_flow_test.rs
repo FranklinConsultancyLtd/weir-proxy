@@ -7,14 +7,14 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use weir::budget::BudgetRegistry;
-use weir::config::{BudgetLimit, TenantLimits};
-use weir::gateway::{router, AppState};
-use weir::provider::Tokenizer;
+use symfynity::budget::BudgetRegistry;
+use symfynity::config::{BudgetLimit, TenantLimits};
+use symfynity::gateway::{router, AppState};
+use symfynity::provider::Tokenizer;
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let app = weir::gateway::health_router();
+    let app = symfynity::gateway::health_router();
     let response = app
         .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
         .await
@@ -33,15 +33,15 @@ fn state_pointed_at(mock_base: &str, tenant: &str, max_tokens: u64) -> AppState 
     // empty — `BudgetRegistry::policy_for` treats a tenant absent from the
     // policies map as entirely unknown (401), not "known but unrestricted".
     let mut policies = HashMap::new();
-    policies.insert(tenant.to_string(), weir::config::PolicyConfig::default());
-    let parsed = weir::config::ParsedConfig { limits, policies };
+    policies.insert(tenant.to_string(), symfynity::config::PolicyConfig::default());
+    let parsed = symfynity::config::ParsedConfig { limits, policies };
     AppState {
         budget: Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(parsed)))),
         tokenizer: Arc::new(Tokenizer::load()),
         http: reqwest::Client::new(),
         openai_base: mock_base.to_string(),
         anthropic_base: mock_base.to_string(),
-        events: Arc::new(weir::telemetry::EventLog::new(1000)),
+        events: Arc::new(symfynity::telemetry::EventLog::new(1000)),
         generation: "test-generation".to_string(),
     }
 }
@@ -66,7 +66,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -102,7 +102,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -137,12 +137,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
     let mut policies = HashMap::new();
     policies.insert(
         "acct_1".to_string(),
-        weir::config::PolicyConfig {
+        symfynity::config::PolicyConfig {
             blocked_models: Vec::new(),
             blocked_tools: vec!["send_email".to_string()],
         },
     );
-    let parsed = weir::config::ParsedConfig { limits, policies };
+    let parsed = symfynity::config::ParsedConfig { limits, policies };
 
     let state = AppState {
         budget: Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(parsed)))),
@@ -150,7 +150,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
         http: reqwest::Client::new(),
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
-        events: Arc::new(weir::telemetry::EventLog::new(100)),
+        events: Arc::new(symfynity::telemetry::EventLog::new(100)),
         generation: "test-generation".to_string(),
     };
     let app = router(state);
@@ -160,7 +160,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -191,8 +191,8 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         BudgetLimit { max_tokens: 1000, window: Duration::from_secs(60) },
     );
     let mut policies = HashMap::new();
-    policies.insert("acct_1".to_string(), weir::config::PolicyConfig::default());
-    let parsed = weir::config::ParsedConfig { limits, policies };
+    policies.insert("acct_1".to_string(), symfynity::config::PolicyConfig::default());
+    let parsed = symfynity::config::ParsedConfig { limits, policies };
 
     let state = AppState {
         budget: Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(parsed)))),
@@ -200,7 +200,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         http: reqwest::Client::new(),
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
-        events: Arc::new(weir::telemetry::EventLog::new(100)),
+        events: Arc::new(symfynity::telemetry::EventLog::new(100)),
         generation: "test-generation".to_string(),
     };
     let app = router(state);
@@ -211,7 +211,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -229,10 +229,10 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         .unwrap();
     assert_eq!(events_response.status(), StatusCode::OK);
     let body = to_bytes(events_response.into_body(), usize::MAX).await.unwrap();
-    let parsed: weir::telemetry::EventsResponse = serde_json::from_slice(&body).unwrap();
+    let parsed: symfynity::telemetry::EventsResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed.generation, "test-generation");
     let events = parsed.events;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tenant, "acct_1");
-    assert_eq!(events[0].outcome, weir::telemetry::UsageOutcome::Completed);
+    assert_eq!(events[0].outcome, symfynity::telemetry::UsageOutcome::Completed);
 }

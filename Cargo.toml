@@ -1,15 +1,15 @@
 [package]
-name = "weir"
-version = "0.2.0"
+name = "symfynity"
+version = "0.3.0"
 edition = "2021"
 license = "BUSL-1.1"
 
 [[bin]]
-name = "weir"
+name = "symfynity"
 path = "src/main.rs"
 
 [lib]
-name = "weir"
+name = "symfynity"
 path = "src/lib.rs"
 
 [dependencies]

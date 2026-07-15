@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::budget::BudgetRegistry;
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use crate::provider::{Provider, ProviderAdapter};
 use crate::telemetry::{EventLog, UsageEvent, UsageOutcome};
 
@@ -75,7 +75,7 @@ struct EventAccounting<'a> {
     tools_seen: &'a mut Vec<String>,
 }
 
-fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Result<EventOutcome, WeirError> {
+fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Result<EventOutcome, SymfynityError> {
     let cost = acc.adapter.chunk_cost(event);
 
     for tool in &cost.tool_calls {
@@ -176,7 +176,7 @@ pub fn enforce(
     blocked_tools: Vec<String>,
     event_log: Arc<EventLog>,
     now_ms: impl Fn() -> i64 + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, WeirError>> {
+) -> impl Stream<Item = Result<Bytes, SymfynityError>> {
     async_stream::stream! {
         let mut tel = StreamTelemetry {
             event_log,
@@ -194,7 +194,7 @@ pub fn enforce(
             let raw = match chunk_res {
                 Ok(raw) => raw,
                 Err(e) => {
-                    yield Err(WeirError::Upstream(e));
+                    yield Err(SymfynityError::Upstream(e));
                     tel.emit(UsageOutcome::UpstreamError, None);
                     return;
                 }

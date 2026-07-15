@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::budget::BudgetRegistry;
 use crate::enforcer;
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use crate::provider::{Provider, Tokenizer};
 use crate::telemetry::{EventLog, EventsResponse, UsageEvent, UsageOutcome};
 
-const TENANT_HEADER: &str = "x-weir-tenant";
+const TENANT_HEADER: &str = "x-symfynity-tenant";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,7 +24,7 @@ pub struct AppState {
     pub anthropic_base: String,
     pub events: Arc<EventLog>,
     /// Per-process identifier included in the `/events` response so a
-    /// consumer can detect a Weir restart (see EventsResponse).
+    /// consumer can detect a SymFynity restart (see EventsResponse).
     pub generation: String,
 }
 
@@ -56,7 +56,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Headers that must never be blindly forwarded between Weir and an
+/// Headers that must never be blindly forwarded between SymFynity and an
 /// upstream provider: hop-by-hop headers (meaningful only for one specific
 /// connection, not the end-to-end request/response) plus `content-length`
 /// (inaccurate once the body is re-streamed).
@@ -76,9 +76,9 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 /// True if this client request header should be forwarded upstream
-/// unmodified. Excludes Weir's own routing header, `host` (must be derived
+/// unmodified. Excludes SymFynity's own routing header, `host` (must be derived
 /// from the actual upstream URL, not copied from the client-facing
-/// request), `accept-encoding` (Weir's HTTP client doesn't decompress
+/// request), `accept-encoding` (SymFynity's HTTP client doesn't decompress
 /// responses, so honoring a client's compression request would make the
 /// adapter parse compressed bytes as SSE text — a silent enforcement
 /// bypass, since it would estimate near-zero tokens for content it can't
@@ -124,7 +124,7 @@ async fn proxy(
 ) -> Response {
     let tenant = match headers.get(TENANT_HEADER).and_then(|v| v.to_str().ok()) {
         Some(t) => t.to_string(),
-        None => return WeirError::UnknownTenant.into_response(),
+        None => return SymfynityError::UnknownTenant.into_response(),
     };
 
     let now = now_ms();
@@ -142,7 +142,7 @@ async fn proxy(
                 rule: None,
                 timestamp_ms: now_ms(),
             });
-            return with_connection_close(WeirError::BudgetExceeded(tenant).into_response());
+            return with_connection_close(SymfynityError::BudgetExceeded(tenant).into_response());
         }
         Err(e) => return with_connection_close(e.into_response()),
     }
@@ -187,7 +187,7 @@ async fn proxy(
             // better DX for a governance product. This matches the specific
             // format used by the internal `UsageEvent.rule` above.
             return with_connection_close(
-                WeirError::PolicyViolation { tenant, reason: format!("blocked_model:{model_name}") }
+                SymfynityError::PolicyViolation { tenant, reason: format!("blocked_model:{model_name}") }
                     .into_response(),
             );
         }
@@ -220,7 +220,7 @@ async fn proxy(
                 rule: None,
                 timestamp_ms: now_ms(),
             });
-            return with_connection_close(WeirError::Upstream(e).into_response());
+            return with_connection_close(SymfynityError::Upstream(e).into_response());
         }
     };
 
@@ -290,7 +290,7 @@ async fn proxy(
                 rule: None,
                 timestamp_ms: now_ms(),
             });
-            return with_connection_close(WeirError::Upstream(e).into_response());
+            return with_connection_close(SymfynityError::Upstream(e).into_response());
         }
     };
 
@@ -317,7 +317,7 @@ async fn proxy(
             // This matches the specific format used by the internal
             // `UsageEvent.rule` above.
             return with_connection_close(
-                WeirError::PolicyViolation { tenant, reason: format!("blocked_tool:{tool}") }
+                SymfynityError::PolicyViolation { tenant, reason: format!("blocked_tool:{tool}") }
                     .into_response(),
             );
         }
@@ -338,7 +338,7 @@ async fn proxy(
                     rule: None,
                     timestamp_ms: now_ms(),
                 });
-                return with_connection_close(WeirError::BudgetExceeded(tenant).into_response());
+                return with_connection_close(SymfynityError::BudgetExceeded(tenant).into_response());
             }
             Err(e) => return with_connection_close(e.into_response()),
         }
@@ -504,7 +504,7 @@ mod tests {
                     .method("POST")
                     .header(TENANT_HEADER, "acct_1")
                     .header("authorization", "Bearer real-secret")
-                    .header("host", "weir.internal.example")
+                    .header("host", "symfynity.internal.example")
                     .body(AxumBody::empty())
                     .unwrap(),
             )
@@ -523,12 +523,12 @@ mod tests {
             "client's real credentials must reach the upstream provider unmodified"
         );
         assert!(
-            !upstream_req.headers.contains_key("x-weir-tenant"),
-            "Weir's own routing header must never be forwarded upstream"
+            !upstream_req.headers.contains_key("x-symfynity-tenant"),
+            "SymFynity's own routing header must never be forwarded upstream"
         );
         assert_ne!(
             upstream_req.headers.get("host").map(|v| v.to_str().unwrap()),
-            Some("weir.internal.example"),
+            Some("symfynity.internal.example"),
             "the client-facing Host header must not override the upstream provider's own host"
         );
     }
@@ -551,7 +551,7 @@ mod tests {
         let app = router(state);
 
         // Larger than Axum's default 2MB request-body limit, but comfortably
-        // under Weir's raised 100MiB cap (see `router()`).
+        // under SymFynity's raised 100MiB cap (see `router()`).
         let large_body = vec![b'x'; 3 * 1024 * 1024];
         let response = app
             .oneshot(
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "a request body larger than axum's default 2MB limit, but under Weir's 100MiB cap, must not be rejected"
+            "a request body larger than axum's default 2MB limit, but under SymFynity's 100MiB cap, must not be rejected"
         );
     }
 
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
-            "a request body larger than Weir's 100MiB cap must be rejected with 413"
+            "a request body larger than SymFynity's 100MiB cap must be rejected with 413"
         );
     }
 

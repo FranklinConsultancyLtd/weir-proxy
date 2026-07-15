@@ -1,12 +1,12 @@
-# Weir Policy Enforcement + Telemetry Implementation Plan
+# SymFynity Policy Enforcement + Telemetry Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add local-config policy enforcement (block disallowed models at admission, block disallowed tools mid-response) and a bounded per-request event log (`/events`), reusing and extending Weir's existing budget-enforcement pipeline rather than building a parallel mechanism.
+**Goal:** Add local-config policy enforcement (block disallowed models at admission, block disallowed tools mid-response) and a bounded per-request event log (`/events`), reusing and extending SymFynity's existing budget-enforcement pipeline rather than building a parallel mechanism.
 
-**Architecture:** Policy (`blocked_models`, `blocked_tools`) is parsed from the same `weir.toml` as budgets, into a new parallel `TenantPolicies` map that hot-reloads alongside `TenantLimits` under one shared, atomically-swapped `ParsedConfig`. Model blocking happens in the gateway before any upstream call (same shape as the existing budget admission check). Tool blocking reuses the adapters' existing tool-call parsing (already built for token counting) — adapters now also report tool *names* (never arguments) in their cost results, and the enforcer/gateway check those names against policy the same way they already check token totals against budget. A new bounded, mutex-guarded ring buffer (`EventLog`) records one `UsageEvent` per completed request (tenant, model, tools called, tokens, blocked-or-not) and is exposed via a new `GET /events?since=<id>&limit=<n>` endpoint.
+**Architecture:** Policy (`blocked_models`, `blocked_tools`) is parsed from the same `symfynity.toml` as budgets, into a new parallel `TenantPolicies` map that hot-reloads alongside `TenantLimits` under one shared, atomically-swapped `ParsedConfig`. Model blocking happens in the gateway before any upstream call (same shape as the existing budget admission check). Tool blocking reuses the adapters' existing tool-call parsing (already built for token counting) — adapters now also report tool *names* (never arguments) in their cost results, and the enforcer/gateway check those names against policy the same way they already check token totals against budget. A new bounded, mutex-guarded ring buffer (`EventLog`) records one `UsageEvent` per completed request (tenant, model, tools called, tokens, blocked-or-not) and is exposed via a new `GET /events?since=<id>&limit=<n>` endpoint.
 
-**Tech Stack:** Same as the existing Weir codebase — Rust, Axum, Tokio, serde/toml, tiktoken-rs.
+**Tech Stack:** Same as the existing SymFynity codebase — Rust, Axum, Tokio, serde/toml, tiktoken-rs.
 
 ## Global Constraints
 
@@ -21,10 +21,10 @@
 ## File Structure
 
 ```
-weir-proxy/
+symfynity-proxy/
 ├── src/
 │   ├── config.rs           (extended: PolicyConfig, ParsedConfig, TenantPolicies, SharedConfig)
-│   ├── error.rs             (extended: WeirError::PolicyViolation)
+│   ├── error.rs             (extended: SymfynityError::PolicyViolation)
 │   ├── budget/
 │   │   └── mod.rs           (extended: BudgetRegistry::policy_for, adapts to ParsedConfig)
 │   ├── provider/
@@ -35,7 +35,7 @@ weir-proxy/
 │   ├── enforcer.rs          (extended: policy check + UsageEvent emission, streaming path)
 │   ├── gateway.rs           (extended: model blocking, non-streaming tool blocking, /events route)
 │   └── main.rs              (extended: EventLog construction)
-├── weir.example.toml        (extended: policy example)
+├── symfynity.example.toml        (extended: policy example)
 └── tests/
     └── proxy_flow_test.rs   (extended: policy blocking + /events integration tests)
 ```
@@ -49,7 +49,7 @@ weir-proxy/
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `PolicyConfig { blocked_models: Vec<String>, blocked_tools: Vec<String> }` (Clone, Default), `ParsedConfig { limits: TenantLimits, policies: TenantPolicies }`, `TenantPolicies = HashMap<String, PolicyConfig>`, `SharedConfig = Arc<ArcSwap<ParsedConfig>>` (type changes from `Arc<ArcSwap<TenantLimits>>`), `parse(contents: &str) -> Result<ParsedConfig, WeirError>` (return type changes from `Result<TenantLimits, WeirError>`), `load_from_file(path) -> Result<ParsedConfig, WeirError>`, `load_shared(path) -> Result<SharedConfig, WeirError>`, `watch(path, shared: SharedConfig) -> notify::Result<notify::RecommendedWatcher>`. `BudgetLimit`/`TenantLimits` themselves are UNCHANGED — only what wraps them changes.
+- Produces: `PolicyConfig { blocked_models: Vec<String>, blocked_tools: Vec<String> }` (Clone, Default), `ParsedConfig { limits: TenantLimits, policies: TenantPolicies }`, `TenantPolicies = HashMap<String, PolicyConfig>`, `SharedConfig = Arc<ArcSwap<ParsedConfig>>` (type changes from `Arc<ArcSwap<TenantLimits>>`), `parse(contents: &str) -> Result<ParsedConfig, SymfynityError>` (return type changes from `Result<TenantLimits, SymfynityError>`), `load_from_file(path) -> Result<ParsedConfig, SymfynityError>`, `load_shared(path) -> Result<SharedConfig, SymfynityError>`, `watch(path, shared: SharedConfig) -> notify::Result<notify::RecommendedWatcher>`. `BudgetLimit`/`TenantLimits` themselves are UNCHANGED — only what wraps them changes.
 
 **Ripple note:** `parse`/`load_from_file`/`load_shared`/`SharedConfig`'s return/generic type all change shape. This ripples into `src/budget/mod.rs` (Task 3), `src/main.rs` (Task 10), and this file's own existing tests (updated in this task) — but does **not** touch `BudgetLimit`, `SlidingWindowCounter`, or `BudgetRegistry`'s counter/CAS internals at all.
 
@@ -67,7 +67,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetLimit {
@@ -111,9 +111,9 @@ struct RawPolicy {
     blocked_tools: Vec<String>,
 }
 
-pub fn parse(contents: &str) -> Result<ParsedConfig, WeirError> {
+pub fn parse(contents: &str) -> Result<ParsedConfig, SymfynityError> {
     let raw: RawConfig =
-        toml::from_str(contents).map_err(|e| WeirError::Config(e.to_string()))?;
+        toml::from_str(contents).map_err(|e| SymfynityError::Config(e.to_string()))?;
 
     let mut limits = TenantLimits::new();
     let mut policies = TenantPolicies::new();
@@ -138,15 +138,15 @@ pub fn parse(contents: &str) -> Result<ParsedConfig, WeirError> {
     Ok(ParsedConfig { limits, policies })
 }
 
-pub fn load_from_file(path: &Path) -> Result<ParsedConfig, WeirError> {
+pub fn load_from_file(path: &Path) -> Result<ParsedConfig, SymfynityError> {
     let contents = std::fs::read_to_string(path)
-        .map_err(|e| WeirError::Config(format!("reading {}: {e}", path.display())))?;
+        .map_err(|e| SymfynityError::Config(format!("reading {}: {e}", path.display())))?;
     parse(&contents)
 }
 
 pub type SharedConfig = Arc<ArcSwap<ParsedConfig>>;
 
-pub fn load_shared(path: &Path) -> Result<SharedConfig, WeirError> {
+pub fn load_shared(path: &Path) -> Result<SharedConfig, SymfynityError> {
     let parsed = load_from_file(path)?;
     Ok(Arc::new(ArcSwap::from_pointee(parsed)))
 }
@@ -179,7 +179,7 @@ pub fn watch(
 Update the existing `#[cfg(test)] mod tests` block: everywhere it currently does
 `let limits = parse(toml).unwrap(); let limit = limits.get("acct_123").unwrap();`,
 change to `let parsed = parse(toml).unwrap(); let limit = parsed.limits.get("acct_123").unwrap();`.
-Keep the `rejects_malformed_toml` test's assertion shape (`matches!(result, Err(WeirError::Config(_)))`)
+Keep the `rejects_malformed_toml` test's assertion shape (`matches!(result, Err(SymfynityError::Config(_)))`)
 unchanged — `parse`'s error path is unaffected by this task.
 
 Add two new tests to the same module:
@@ -241,27 +241,27 @@ Note: this commit will not compile the whole crate by itself (`budget/mod.rs` an
 
 ---
 
-### Task 2: WeirError::PolicyViolation
+### Task 2: SymfynityError::PolicyViolation
 
 **Files:**
 - Modify: `src/error.rs`
 
 **Interfaces:**
-- Produces: new `WeirError::PolicyViolation { tenant: String, reason: String }` variant, mapped to `403 Forbidden` / `"policy_violation"` in `IntoResponse`.
+- Produces: new `SymfynityError::PolicyViolation { tenant: String, reason: String }` variant, mapped to `403 Forbidden` / `"policy_violation"` in `IntoResponse`.
 
 - [ ] **Step 1: Write the failing test**
 
-Read the current `src/error.rs` first. Add the new variant to the existing `WeirError` enum (do not remove or reorder existing variants):
+Read the current `src/error.rs` first. Add the new variant to the existing `SymfynityError` enum (do not remove or reorder existing variants):
 
 ```rust
     #[error("tenant '{tenant}' violated policy: {reason}")]
     PolicyViolation { tenant: String, reason: String },
 ```
 
-Add a new arm to the existing `match &self { ... }` inside `impl IntoResponse for WeirError`:
+Add a new arm to the existing `match &self { ... }` inside `impl IntoResponse for SymfynityError`:
 
 ```rust
-            WeirError::PolicyViolation { .. } => (StatusCode::FORBIDDEN, "policy_violation"),
+            SymfynityError::PolicyViolation { .. } => (StatusCode::FORBIDDEN, "policy_violation"),
 ```
 
 Add a new test to the existing `#[cfg(test)] mod tests` block:
@@ -269,7 +269,7 @@ Add a new test to the existing `#[cfg(test)] mod tests` block:
 ```rust
     #[test]
     fn policy_violation_maps_to_403() {
-        let response = WeirError::PolicyViolation {
+        let response = SymfynityError::PolicyViolation {
             tenant: "acct_1".into(),
             reason: "blocked_tool: send_email".into(),
         }
@@ -292,7 +292,7 @@ Expected: PASS (3 tests: the 2 existing plus the new one)
 
 ```bash
 git add src/error.rs
-git commit -m "feat: add WeirError::PolicyViolation mapped to 403"
+git commit -m "feat: add SymfynityError::PolicyViolation mapped to 403"
 ```
 
 ---
@@ -303,8 +303,8 @@ git commit -m "feat: add WeirError::PolicyViolation mapped to 403"
 - Modify: `src/budget/mod.rs`
 
 **Interfaces:**
-- Consumes: `ParsedConfig`, `SharedConfig`, `PolicyConfig` (Task 1), `WeirError::PolicyViolation` is NOT used here (policy_for returns `WeirError::UnknownTenant` for an unknown tenant, same as `limit_for` — the *violation itself* is decided by callers in Tasks 8/9, not by this lookup).
-- Produces: `BudgetRegistry::new(config: SharedConfig) -> Self` (parameter type changes from `Arc<ArcSwap<TenantLimits>>`), `pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, WeirError>` (new). `is_within_budget`, `record`, `counter_for`'s internal CAS/counter logic are **UNCHANGED** — only the config-lookup layer (`limit_for`) changes.
+- Consumes: `ParsedConfig`, `SharedConfig`, `PolicyConfig` (Task 1), `SymfynityError::PolicyViolation` is NOT used here (policy_for returns `SymfynityError::UnknownTenant` for an unknown tenant, same as `limit_for` — the *violation itself* is decided by callers in Tasks 8/9, not by this lookup).
+- Produces: `BudgetRegistry::new(config: SharedConfig) -> Self` (parameter type changes from `Arc<ArcSwap<TenantLimits>>`), `pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, SymfynityError>` (new). `is_within_budget`, `record`, `counter_for`'s internal CAS/counter logic are **UNCHANGED** — only the config-lookup layer (`limit_for`) changes.
 
 **Ripple note:** `BudgetRegistry` now does double duty (budget AND policy lookups) rather than being renamed — this is a deliberate, accepted small naming imprecision to avoid renaming a type used throughout the whole codebase (`AppState.budget: Arc<BudgetRegistry>` etc.) for a two-field addition. Do not rename `BudgetRegistry` as part of this task.
 
@@ -319,7 +319,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::config::{BudgetLimit, ParsedConfig, PolicyConfig, SharedConfig};
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use sliding_window::SlidingWindowCounter;
 
 pub struct BudgetRegistry {
@@ -335,25 +335,25 @@ impl BudgetRegistry {
         Self { config, counters: DashMap::new() }
     }
 
-    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, WeirError> {
+    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, SymfynityError> {
         self.config
             .load()
             .limits
             .get(tenant)
             .copied()
-            .ok_or(WeirError::UnknownTenant)
+            .ok_or(SymfynityError::UnknownTenant)
     }
 
     /// Returns the tenant's configured policy (blocked models/tools). An
     /// unknown tenant is the same error `limit_for` returns for the same
     /// reason — both are reading the same underlying config snapshot.
-    pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, WeirError> {
+    pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, SymfynityError> {
         self.config
             .load()
             .policies
             .get(tenant)
             .cloned()
-            .ok_or(WeirError::UnknownTenant)
+            .ok_or(SymfynityError::UnknownTenant)
     }
 
     // Fast path: try a borrowed lookup first to avoid allocating an
@@ -384,7 +384,7 @@ impl BudgetRegistry {
         entry.1.clone()
     }
 
-    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         Ok(counter.estimate(now_ms) < limit.max_tokens)
@@ -395,7 +395,7 @@ impl BudgetRegistry {
     /// the *next* admission check once genuinely at or over the ceiling
     /// (`is_within_budget` uses strict `<`). This lets a tenant consume its
     /// full budget rather than being cut off one token short of it.
-    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         let total = counter.add(amount, now_ms);
@@ -456,7 +456,7 @@ Add one new test:
         assert_eq!(policy.blocked_models, vec!["gpt-3.5-turbo".to_string()]);
         assert_eq!(policy.blocked_tools, vec!["send_email".to_string()]);
 
-        assert!(matches!(registry.policy_for("acct_unknown"), Err(WeirError::UnknownTenant)));
+        assert!(matches!(registry.policy_for("acct_unknown"), Err(SymfynityError::UnknownTenant)));
     }
 ```
 
@@ -1010,7 +1010,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::budget::BudgetRegistry;
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use crate::provider::{Provider, ProviderAdapter};
 use crate::telemetry::{EventLog, UsageEvent};
 
@@ -1080,7 +1080,7 @@ struct EventAccounting<'a> {
     tools_seen: &'a mut Vec<String>,
 }
 
-fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Result<EventOutcome, WeirError> {
+fn process_event(acc: &mut EventAccounting, event: &Bytes, now_ms: i64) -> Result<EventOutcome, SymfynityError> {
     let cost = acc.adapter.chunk_cost(event);
 
     for tool in &cost.tool_calls {
@@ -1134,7 +1134,7 @@ pub fn enforce(
     blocked_tools: Vec<String>,
     event_log: Arc<EventLog>,
     now_ms: impl Fn() -> i64 + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, WeirError>> {
+) -> impl Stream<Item = Result<Bytes, SymfynityError>> {
     async_stream::stream! {
         let mut recorded_so_far: u64 = 0;
         let mut tools_seen: Vec<String> = Vec::new();
@@ -1161,7 +1161,7 @@ pub fn enforce(
             let raw = match chunk_res {
                 Ok(raw) => raw,
                 Err(e) => {
-                    yield Err(WeirError::Upstream(e));
+                    yield Err(SymfynityError::Upstream(e));
                     emit_and_return!(true, Some("upstream_error".to_string()));
                 }
             };
@@ -1433,14 +1433,14 @@ async fn proxy(
 ) -> Response {
     let tenant = match headers.get(TENANT_HEADER).and_then(|v| v.to_str().ok()) {
         Some(t) => t.to_string(),
-        None => return WeirError::UnknownTenant.into_response(),
+        None => return SymfynityError::UnknownTenant.into_response(),
     };
 
     let now = now_ms();
     match state.budget.is_within_budget(&tenant, now) {
         Ok(true) => {}
         Ok(false) => {
-            return with_connection_close(WeirError::BudgetExceeded(tenant).into_response())
+            return with_connection_close(SymfynityError::BudgetExceeded(tenant).into_response())
         }
         Err(e) => return with_connection_close(e.into_response()),
     }
@@ -1465,7 +1465,7 @@ async fn proxy(
                 timestamp_ms: now_ms(),
             });
             return with_connection_close(
-                WeirError::PolicyViolation {
+                SymfynityError::PolicyViolation {
                     tenant,
                     reason: format!("blocked_model:{model_name}"),
                 }
@@ -1489,7 +1489,7 @@ async fn proxy(
 
     let upstream_res = match upstream_req.send().await {
         Ok(res) => res,
-        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+        Err(e) => return with_connection_close(SymfynityError::Upstream(e).into_response()),
     };
 
     let status = upstream_res.status();
@@ -1546,7 +1546,7 @@ async fn proxy(
     // rather than delivered to the client.
     let body_bytes = match upstream_res.bytes().await {
         Ok(b) => b,
-        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+        Err(e) => return with_connection_close(SymfynityError::Upstream(e).into_response()),
     };
 
     let adapter = state.tokenizer.new_adapter(provider);
@@ -1566,7 +1566,7 @@ async fn proxy(
                 timestamp_ms: now_ms(),
             });
             return with_connection_close(
-                WeirError::PolicyViolation {
+                SymfynityError::PolicyViolation {
                     tenant,
                     reason: format!("blocked_tool:{tool}"),
                 }
@@ -1590,7 +1590,7 @@ async fn proxy(
                     block_reason: Some("budget_exceeded".to_string()),
                     timestamp_ms: now_ms(),
                 });
-                return with_connection_close(WeirError::BudgetExceeded(tenant).into_response());
+                return with_connection_close(SymfynityError::BudgetExceeded(tenant).into_response());
             }
             Err(e) => return with_connection_close(e.into_response()),
         }
@@ -1802,11 +1802,11 @@ git commit -m "feat: gateway enforces model/tool policy and exposes GET /events"
 
 Read the current `src/main.rs` first (it already has the graceful-shutdown addition from a previous fix — do not remove `shutdown_signal`/the `.with_graceful_shutdown(...)` call). Add the import:
 ```rust
-use weir::telemetry::EventLog;
+use symfynity::telemetry::EventLog;
 ```
 Add a new env-configurable capacity right after the existing `config_path` resolution:
 ```rust
-    let event_log_capacity: usize = env::var("WEIR_EVENT_LOG_CAPACITY")
+    let event_log_capacity: usize = env::var("SYMFYNITY_EVENT_LOG_CAPACITY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
@@ -1835,14 +1835,14 @@ git commit -m "feat: wire EventLog into AppState with configurable capacity"
 ### Task 11: Example config and README updates
 
 **Files:**
-- Modify: `weir.example.toml`
+- Modify: `symfynity.example.toml`
 - Modify: `README.md`
 
 **Interfaces:** none — documentation/example only.
 
 - [ ] **Step 1: Update the example config**
 
-Read the current `weir.example.toml`. Add a policy example to one of the two existing tenants:
+Read the current `symfynity.example.toml`. Add a policy example to one of the two existing tenants:
 
 ```toml
 [tenants.acct_123]
@@ -1860,12 +1860,12 @@ window_seconds = 3600
 
 - [ ] **Step 2: Update the README**
 
-Read the current `README.md`. In the "Configuration" section, after the existing `weir.toml` example, add a short paragraph and example covering the new `policy` block — mention that `blocked_models` rejects a request before any upstream call, `blocked_tools` trips mid-stream (or rejects a non-streaming response) the same way a budget overrun does, and that omitting `policy` entirely means no restrictions beyond budget. Also add a one-line mention of the new `GET /events?since=&limit=` endpoint alongside the existing description of `/stats`-equivalent behavior (note: `/stats` itself does not exist as of this plan — only add documentation for what this plan actually built: `/events`. Do not invent or reference a `/stats` endpoint that doesn't exist in the codebase.).
+Read the current `README.md`. In the "Configuration" section, after the existing `symfynity.toml` example, add a short paragraph and example covering the new `policy` block — mention that `blocked_models` rejects a request before any upstream call, `blocked_tools` trips mid-stream (or rejects a non-streaming response) the same way a budget overrun does, and that omitting `policy` entirely means no restrictions beyond budget. Also add a one-line mention of the new `GET /events?since=&limit=` endpoint alongside the existing description of `/stats`-equivalent behavior (note: `/stats` itself does not exist as of this plan — only add documentation for what this plan actually built: `/events`. Do not invent or reference a `/stats` endpoint that doesn't exist in the codebase.).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add weir.example.toml README.md
+git add symfynity.example.toml README.md
 git commit -m "docs: document policy config and /events endpoint"
 ```
 
@@ -1903,12 +1903,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
     let mut policies = HashMap::new();
     policies.insert(
         "acct_1".to_string(),
-        weir::config::PolicyConfig {
+        symfynity::config::PolicyConfig {
             blocked_models: Vec::new(),
             blocked_tools: vec!["send_email".to_string()],
         },
     );
-    let parsed = weir::config::ParsedConfig { limits, policies };
+    let parsed = symfynity::config::ParsedConfig { limits, policies };
 
     let state = AppState {
         budget: Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(parsed)))),
@@ -1916,7 +1916,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
         http: reqwest::Client::new(),
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
-        events: Arc::new(weir::telemetry::EventLog::new(100)),
+        events: Arc::new(symfynity::telemetry::EventLog::new(100)),
     };
     let app = router(state);
 
@@ -1925,7 +1925,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1955,7 +1955,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         "acct_1".to_string(),
         BudgetLimit { max_tokens: 1000, window: Duration::from_secs(60) },
     );
-    let parsed = weir::config::ParsedConfig { limits, policies: HashMap::new() };
+    let parsed = symfynity::config::ParsedConfig { limits, policies: HashMap::new() };
 
     let state = AppState {
         budget: Arc::new(BudgetRegistry::new(Arc::new(arc_swap::ArcSwap::from_pointee(parsed)))),
@@ -1963,7 +1963,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         http: reqwest::Client::new(),
         openai_base: mock.uri(),
         anthropic_base: mock.uri(),
-        events: Arc::new(weir::telemetry::EventLog::new(100)),
+        events: Arc::new(symfynity::telemetry::EventLog::new(100)),
     };
     let app = router(state);
 
@@ -1973,7 +1973,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1986,14 +1986,14 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
         .unwrap();
     assert_eq!(events_response.status(), StatusCode::OK);
     let body = to_bytes(events_response.into_body(), usize::MAX).await.unwrap();
-    let events: Vec<weir::telemetry::UsageEvent> = serde_json::from_slice(&body).unwrap();
+    let events: Vec<symfynity::telemetry::UsageEvent> = serde_json::from_slice(&body).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tenant, "acct_1");
     assert!(!events[0].blocked);
 }
 ```
 
-Check the top of the file for existing `use` statements (`weir::budget::BudgetRegistry`, `weir::config::{BudgetLimit, TenantLimits}`, `weir::gateway::{router, AppState}`, `weir::provider::Tokenizer`, `std::collections::HashMap`, `std::time::Duration`, `std::sync::Arc`, wiremock imports, `axum::body::{to_bytes, Body}`, `axum::http::{Request, StatusCode}`, `tower::ServiceExt`) and add only what's missing (`weir::config::PolicyConfig`/`ParsedConfig` and `weir::telemetry::{EventLog, UsageEvent}` are referenced above via fully-qualified paths in most spots to avoid import-list churn — keep it that way rather than adding more top-level `use` lines, to minimize risk of colliding with an existing name).
+Check the top of the file for existing `use` statements (`symfynity::budget::BudgetRegistry`, `symfynity::config::{BudgetLimit, TenantLimits}`, `symfynity::gateway::{router, AppState}`, `symfynity::provider::Tokenizer`, `std::collections::HashMap`, `std::time::Duration`, `std::sync::Arc`, wiremock imports, `axum::body::{to_bytes, Body}`, `axum::http::{Request, StatusCode}`, `tower::ServiceExt`) and add only what's missing (`symfynity::config::PolicyConfig`/`ParsedConfig` and `symfynity::telemetry::{EventLog, UsageEvent}` are referenced above via fully-qualified paths in most spots to avoid import-list churn — keep it that way rather than adding more top-level `use` lines, to minimize risk of colliding with an existing name).
 
 - [ ] **Step 2: Run tests to verify they fail**
 

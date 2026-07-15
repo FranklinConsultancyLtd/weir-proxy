@@ -1,4 +1,4 @@
-# Weir — AI Proxy Circuit Breaker: Design Spec
+# SymFynity — AI Proxy Circuit Breaker: Design Spec
 
 **Status:** Approved
 **Date:** 2026-07-10
@@ -9,11 +9,11 @@
 As teams build more agentic and tool-calling AI systems, faulty state logic in recursive
 agents or tool-calling loops can cause exponential, unmonitored API token spend — a
 "Runaway Agentic Loop." Standard FinOps billing dashboards report hourly or daily,
-long after the damage is done. Weir is a low-latency, streaming-native inline proxy that
+long after the damage is done. SymFynity is a low-latency, streaming-native inline proxy that
 sits between a client application and an LLM provider (OpenAI, Anthropic) and enforces
 token budgets in real time, severing a stream the moment it breaches a configured ceiling.
 
-Weir is a standalone open-source infrastructure project. It has no dependency on, and
+SymFynity is a standalone open-source infrastructure project. It has no dependency on, and
 makes no reference to, any hosted or commercial offering.
 
 ## Goals
@@ -29,21 +29,21 @@ makes no reference to, any hosted or commercial offering.
 
 ## Non-Goals
 
-- Centralized multi-cluster management, alerting, or reporting. Weir is a single-node
+- Centralized multi-cluster management, alerting, or reporting. SymFynity is a single-node
   proxy; running many instances across an org is an operational/deployment concern
   outside this project's scope, not a feature it provides.
-- Exact real-time token accounting. Interim costs are estimated; Weir reconciles
+- Exact real-time token accounting. Interim costs are estimated; SymFynity reconciles
   against authoritative provider usage data as it becomes available in the stream.
 
 ## Architecture
 
 A single Rust binary (Axum + Tokio + Hyper) deployed inline between a client
 application and the upstream LLM provider. Client credentials pass through unmodified
-— Weir never stores or reissues provider API keys. All state is in-process memory;
+— SymFynity never stores or reissues provider API keys. All state is in-process memory;
 no Redis, no external dependencies.
 
 ```
-Client app -> Weir (Axum) -> [budget check] -> Upstream (OpenAI / Anthropic)
+Client app -> SymFynity (Axum) -> [budget check] -> Upstream (OpenAI / Anthropic)
                                   |
                       In-memory tenant budget table
                       (sliding-window atomic counters)
@@ -110,7 +110,7 @@ Two trip points:
    a new request arrives, reject before proxying upstream: a real `HTTP 429`, since
    no response headers have been committed yet.
 2. **Mid-stream check** — for a request admitted while under budget, if forwarding
-   the next chunk would breach the ceiling, Weir does not forward it. Instead it
+   the next chunk would breach the ceiling, SymFynity does not forward it. Instead it
    emits a terminal SSE error event (`event: error` /
    `data: {"error":"budget_exceeded"}`) and closes the connection. A true
    status-code 429 is not possible here — the response's `200` status and headers

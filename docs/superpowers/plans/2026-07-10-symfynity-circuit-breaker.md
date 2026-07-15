@@ -1,8 +1,8 @@
-# Weir Circuit Breaker Implementation Plan
+# SymFynity Circuit Breaker Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build Weir, a standalone open-source inline proxy that enforces rolling token budgets per tenant/API-key across OpenAI and Anthropic streaming traffic, tripping mid-stream on breach.
+**Goal:** Build SymFynity, a standalone open-source inline proxy that enforces rolling token budgets per tenant/API-key across OpenAI and Anthropic streaming traffic, tripping mid-stream on breach.
 
 **Architecture:** A single Rust binary (Axum inbound + reqwest outbound, both on Tokio) sits between a client application and the real LLM provider. Every SSE chunk is cost-estimated (real tokenizer, reconciled against each provider's authoritative usage data), added to an in-memory lock-adjacent sliding-window counter for the tenant, and checked *before* being forwarded. A tenant already over budget is rejected at admission with a real `429`; a tenant that breaches mid-stream gets a terminal SSE error event and the connection is closed (`Connection: close`) rather than kept alive.
 
@@ -13,7 +13,7 @@
 - Added processing latency to time-to-first-token must not exceed ~2ms under peak load — no blocking I/O, no unnecessary allocation, on the hot path.
 - Hot path must avoid global mutex contention: atomic counters and sharded concurrent maps only, no per-request heap growth beyond what a single chunk requires.
 - No prompt/response data is cached or persisted anywhere — nothing is written to disk or an external store.
-- Weir is a standalone open-source project. Nothing in code, comments, config, or docs may reference a hosted/commercial offering.
+- SymFynity is a standalone open-source project. Nothing in code, comments, config, or docs may reference a hosted/commercial offering.
 - License: Apache License 2.0 (already present as `LICENSE` in the repo root).
 - Ships as a single binary, packaged as a Docker image for `linux/amd64` and `linux/arm64`.
 
@@ -22,7 +22,7 @@
 ## File Structure
 
 ```
-weir-proxy/
+symfynity-proxy/
 ├── Cargo.toml
 ├── Dockerfile
 ├── src/
@@ -59,23 +59,23 @@ weir-proxy/
 - Test: `tests/proxy_flow_test.rs` (stub with the first health-check test)
 
 **Interfaces:**
-- Produces: `weir::gateway::health_router() -> axum::Router` — used by Task 10 as the base router and by this task's own test.
+- Produces: `symfynity::gateway::health_router() -> axum::Router` — used by Task 10 as the base router and by this task's own test.
 
 - [ ] **Step 1: Create `Cargo.toml`**
 
 ```toml
 [package]
-name = "weir"
+name = "symfynity"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [[bin]]
-name = "weir"
+name = "symfynity"
 path = "src/main.rs"
 
 [lib]
-name = "weir"
+name = "symfynity"
 path = "src/lib.rs"
 
 [dependencies]
@@ -112,7 +112,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let app = weir::gateway::health_router();
+    let app = symfynity::gateway::health_router();
     let response = app
         .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
         .await
@@ -124,7 +124,7 @@ async fn healthz_returns_ok() {
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `cargo test --test proxy_flow_test`
-Expected: FAIL to compile — `weir::gateway` module does not exist yet.
+Expected: FAIL to compile — `symfynity::gateway` module does not exist yet.
 
 - [ ] **Step 4: Write minimal implementation**
 
@@ -152,9 +152,9 @@ Create `src/main.rs`:
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let app = weir::gateway::health_router();
+    let app = symfynity::gateway::health_router();
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    tracing::info!("weir listening on 0.0.0.0:8080");
+    tracing::info!("symfynity listening on 0.0.0.0:8080");
     axum::serve(listener, app).await.unwrap();
 }
 ```
@@ -168,7 +168,7 @@ Expected: PASS
 
 ```bash
 git add Cargo.toml src/lib.rs src/main.rs src/gateway.rs tests/proxy_flow_test.rs
-git commit -m "chore: scaffold Weir binary with health check endpoint"
+git commit -m "chore: scaffold SymFynity binary with health check endpoint"
 ```
 
 ---
@@ -180,7 +180,7 @@ git commit -m "chore: scaffold Weir binary with health check endpoint"
 - Modify: `src/lib.rs`
 
 **Interfaces:**
-- Produces: `WeirError` enum with variants `BudgetExceeded(String)`, `UnknownTenant`, `Upstream(reqwest::Error)`, `Config(String)`. Implements `IntoResponse` (429 / 401 / 502 / 500 respectively) and `std::error::Error` (via `thiserror`). Used by every later task.
+- Produces: `SymfynityError` enum with variants `BudgetExceeded(String)`, `UnknownTenant`, `Upstream(reqwest::Error)`, `Config(String)`. Implements `IntoResponse` (429 / 401 / 502 / 500 respectively) and `std::error::Error` (via `thiserror`). Used by every later task.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -192,10 +192,10 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
-pub enum WeirError {
+pub enum SymfynityError {
     #[error("tenant '{0}' has exceeded its token budget")]
     BudgetExceeded(String),
-    #[error("unknown tenant or missing X-Weir-Tenant header")]
+    #[error("unknown tenant or missing X-Symfynity-Tenant header")]
     UnknownTenant,
     #[error("upstream provider request failed: {0}")]
     Upstream(#[from] reqwest::Error),
@@ -209,13 +209,13 @@ struct ErrorBody {
     message: String,
 }
 
-impl IntoResponse for WeirError {
+impl IntoResponse for SymfynityError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
-            WeirError::BudgetExceeded(_) => (StatusCode::TOO_MANY_REQUESTS, "budget_exceeded"),
-            WeirError::UnknownTenant => (StatusCode::UNAUTHORIZED, "unknown_tenant"),
-            WeirError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
-            WeirError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
+            SymfynityError::BudgetExceeded(_) => (StatusCode::TOO_MANY_REQUESTS, "budget_exceeded"),
+            SymfynityError::UnknownTenant => (StatusCode::UNAUTHORIZED, "unknown_tenant"),
+            SymfynityError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+            SymfynityError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
         };
         let body = ErrorBody { error: code, message: self.to_string() };
         (status, axum::Json(body)).into_response()
@@ -228,13 +228,13 @@ mod tests {
 
     #[test]
     fn budget_exceeded_maps_to_429() {
-        let response = WeirError::BudgetExceeded("acct_1".into()).into_response();
+        let response = SymfynityError::BudgetExceeded("acct_1".into()).into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn unknown_tenant_maps_to_401() {
-        let response = WeirError::UnknownTenant.into_response();
+        let response = SymfynityError::UnknownTenant.into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
@@ -263,7 +263,7 @@ Expected: PASS (2 tests)
 
 ```bash
 git add src/error.rs src/lib.rs
-git commit -m "feat: add WeirError with HTTP status mapping"
+git commit -m "feat: add SymfynityError with HTTP status mapping"
 ```
 
 ---
@@ -446,7 +446,7 @@ git commit -m "feat: add lock-free sliding-window token counter"
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `BudgetLimit { max_tokens: u64, window: Duration }` (Clone, Copy), `TenantLimits = HashMap<String, BudgetLimit>`, `parse(contents: &str) -> Result<TenantLimits, WeirError>`, `load_from_file(path: &Path) -> Result<TenantLimits, WeirError>`. Used by Task 5 (`BudgetRegistry`) and Task 6 (hot-reload).
+- Produces: `BudgetLimit { max_tokens: u64, window: Duration }` (Clone, Copy), `TenantLimits = HashMap<String, BudgetLimit>`, `parse(contents: &str) -> Result<TenantLimits, SymfynityError>`, `load_from_file(path: &Path) -> Result<TenantLimits, SymfynityError>`. Used by Task 5 (`BudgetRegistry`) and Task 6 (hot-reload).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -458,7 +458,7 @@ use std::path::Path;
 use std::time::Duration;
 use serde::Deserialize;
 
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetLimit {
@@ -479,9 +479,9 @@ struct RawTenantLimit {
     window_seconds: u64,
 }
 
-pub fn parse(contents: &str) -> Result<TenantLimits, WeirError> {
+pub fn parse(contents: &str) -> Result<TenantLimits, SymfynityError> {
     let raw: RawConfig =
-        toml::from_str(contents).map_err(|e| WeirError::Config(e.to_string()))?;
+        toml::from_str(contents).map_err(|e| SymfynityError::Config(e.to_string()))?;
     Ok(raw
         .tenants
         .into_iter()
@@ -497,9 +497,9 @@ pub fn parse(contents: &str) -> Result<TenantLimits, WeirError> {
         .collect())
 }
 
-pub fn load_from_file(path: &Path) -> Result<TenantLimits, WeirError> {
+pub fn load_from_file(path: &Path) -> Result<TenantLimits, SymfynityError> {
     let contents = std::fs::read_to_string(path)
-        .map_err(|e| WeirError::Config(format!("reading {}: {e}", path.display())))?;
+        .map_err(|e| SymfynityError::Config(format!("reading {}: {e}", path.display())))?;
     parse(&contents)
 }
 
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn rejects_malformed_toml() {
         let result = parse("not valid toml {{{");
-        assert!(matches!(result, Err(WeirError::Config(_))));
+        assert!(matches!(result, Err(SymfynityError::Config(_))));
     }
 }
 ```
@@ -564,8 +564,8 @@ git commit -m "feat: add TOML config parsing for tenant budget limits"
 - Modify: `src/budget/mod.rs`
 
 **Interfaces:**
-- Consumes: `SlidingWindowCounter` (Task 3), `TenantLimits`/`BudgetLimit` (Task 4), `WeirError` (Task 2).
-- Produces: `BudgetRegistry::new(limits: Arc<ArcSwap<TenantLimits>>) -> Self`, `.is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, WeirError>`, `.record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, WeirError>` (returns whether still within budget after recording). Used by Task 9 (`enforcer`) and Task 10 (`gateway`).
+- Consumes: `SlidingWindowCounter` (Task 3), `TenantLimits`/`BudgetLimit` (Task 4), `SymfynityError` (Task 2).
+- Produces: `BudgetRegistry::new(limits: Arc<ArcSwap<TenantLimits>>) -> Self`, `.is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, SymfynityError>`, `.record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, SymfynityError>` (returns whether still within budget after recording). Used by Task 9 (`enforcer`) and Task 10 (`gateway`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -579,7 +579,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 use crate::config::{BudgetLimit, TenantLimits};
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use sliding_window::SlidingWindowCounter;
 
 pub struct BudgetRegistry {
@@ -592,12 +592,12 @@ impl BudgetRegistry {
         Self { limits, counters: DashMap::new() }
     }
 
-    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, WeirError> {
+    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, SymfynityError> {
         self.limits
             .load()
             .get(tenant)
             .copied()
-            .ok_or(WeirError::UnknownTenant)
+            .ok_or(SymfynityError::UnknownTenant)
     }
 
     fn counter_for(&self, tenant: &str, limit: BudgetLimit) -> Arc<SlidingWindowCounter> {
@@ -607,13 +607,13 @@ impl BudgetRegistry {
             .clone()
     }
 
-    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         Ok(counter.estimate(now_ms) < limit.max_tokens)
     }
 
-    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         let total = counter.add(amount, now_ms);
@@ -640,7 +640,7 @@ mod registry_tests {
     fn unknown_tenant_is_rejected() {
         let registry = registry_with("acct_1", 1000, 60);
         let result = registry.is_within_budget("acct_unknown", 0);
-        assert!(matches!(result, Err(WeirError::UnknownTenant)));
+        assert!(matches!(result, Err(SymfynityError::UnknownTenant)));
     }
 
     #[test]
@@ -682,7 +682,7 @@ git commit -m "feat: add BudgetRegistry mapping tenants to sliding-window budget
 
 **Interfaces:**
 - Consumes: `TenantLimits`, `parse`/`load_from_file` (this file, Task 4).
-- Produces: `SharedConfig = Arc<ArcSwap<TenantLimits>>`, `load_shared(path: &Path) -> Result<SharedConfig, WeirError>`, `watch(path: PathBuf, shared: SharedConfig) -> notify::Result<notify::RecommendedWatcher>`. Used by Task 11 (`main.rs`).
+- Produces: `SharedConfig = Arc<ArcSwap<TenantLimits>>`, `load_shared(path: &Path) -> Result<SharedConfig, SymfynityError>`, `watch(path: PathBuf, shared: SharedConfig) -> notify::Result<notify::RecommendedWatcher>`. Used by Task 11 (`main.rs`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -695,7 +695,7 @@ use arc_swap::ArcSwap;
 
 pub type SharedConfig = Arc<ArcSwap<TenantLimits>>;
 
-pub fn load_shared(path: &Path) -> Result<SharedConfig, WeirError> {
+pub fn load_shared(path: &Path) -> Result<SharedConfig, SymfynityError> {
     let limits = load_from_file(path)?;
     Ok(Arc::new(ArcSwap::from_pointee(limits)))
 }
@@ -1227,8 +1227,8 @@ git commit -m "feat: add Anthropic adapter with incremental usage reconciliation
 - Modify: `src/lib.rs`
 
 **Interfaces:**
-- Consumes: `BudgetRegistry` (Task 5), `ProviderAdapter`/`ChunkCost` (Tasks 7–8), `WeirError` (Task 2).
-- Produces: `pub fn enforce(tenant: String, upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static, adapter: Box<dyn ProviderAdapter>, budget: Arc<BudgetRegistry>, now_ms: impl Fn() -> i64 + Send + 'static) -> impl Stream<Item = Result<Bytes, WeirError>>`. Used by Task 10 (`gateway`).
+- Consumes: `BudgetRegistry` (Task 5), `ProviderAdapter`/`ChunkCost` (Tasks 7–8), `SymfynityError` (Task 2).
+- Produces: `pub fn enforce(tenant: String, upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static, adapter: Box<dyn ProviderAdapter>, budget: Arc<BudgetRegistry>, now_ms: impl Fn() -> i64 + Send + 'static) -> impl Stream<Item = Result<Bytes, SymfynityError>>`. Used by Task 10 (`gateway`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1240,7 +1240,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::budget::BudgetRegistry;
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use crate::provider::ProviderAdapter;
 
 const BUDGET_EXCEEDED_EVENT: &[u8] =
@@ -1256,7 +1256,7 @@ pub fn enforce(
     mut adapter: Box<dyn ProviderAdapter>,
     budget: Arc<BudgetRegistry>,
     now_ms: impl Fn() -> i64 + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, WeirError>> {
+) -> impl Stream<Item = Result<Bytes, SymfynityError>> {
     async_stream::stream! {
         let mut recorded_so_far: u64 = 0;
 
@@ -1264,7 +1264,7 @@ pub fn enforce(
             let raw = match chunk_res {
                 Ok(raw) => raw,
                 Err(e) => {
-                    yield Err(WeirError::Upstream(e));
+                    yield Err(SymfynityError::Upstream(e));
                     return;
                 }
             };
@@ -1405,7 +1405,7 @@ git commit -m "feat: add stream enforcer with check-before-yield budget trip"
 - Modify: `src/gateway.rs` (replace Task 1's stub)
 
 **Interfaces:**
-- Consumes: `BudgetRegistry` (Task 5), `Tokenizer`/`Provider` (Task 7), `enforce` (Task 9), `WeirError` (Task 2).
+- Consumes: `BudgetRegistry` (Task 5), `Tokenizer`/`Provider` (Task 7), `enforce` (Task 9), `SymfynityError` (Task 2).
 - Produces: `AppState { budget: Arc<BudgetRegistry>, tokenizer: Arc<Tokenizer>, http: reqwest::Client, openai_base: String, anthropic_base: String }`, `router(state: AppState) -> Router`. Used by Task 11 (`main.rs`).
 
 - [ ] **Step 1: Write the failing test**
@@ -1424,10 +1424,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::budget::BudgetRegistry;
 use crate::enforcer;
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use crate::provider::{Provider, Tokenizer};
 
-const TENANT_HEADER: &str = "x-weir-tenant";
+const TENANT_HEADER: &str = "x-symfynity-tenant";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1473,14 +1473,14 @@ async fn proxy(
 ) -> Response {
     let tenant = match headers.get(TENANT_HEADER).and_then(|v| v.to_str().ok()) {
         Some(t) => t.to_string(),
-        None => return WeirError::UnknownTenant.into_response(),
+        None => return SymfynityError::UnknownTenant.into_response(),
     };
 
     let now = now_ms();
     match state.budget.is_within_budget(&tenant, now) {
         Ok(true) => {}
         Ok(false) => {
-            return with_connection_close(WeirError::BudgetExceeded(tenant).into_response())
+            return with_connection_close(SymfynityError::BudgetExceeded(tenant).into_response())
         }
         Err(e) => return with_connection_close(e.into_response()),
     }
@@ -1500,7 +1500,7 @@ async fn proxy(
 
     let upstream_res = match upstream_req.send().await {
         Ok(res) => res,
-        Err(e) => return with_connection_close(WeirError::Upstream(e).into_response()),
+        Err(e) => return with_connection_close(SymfynityError::Upstream(e).into_response()),
     };
 
     let status = upstream_res.status();
@@ -1618,15 +1618,15 @@ git commit -m "feat: add gateway proxy routes with tenant admission check"
 
 **Files:**
 - Modify: `src/main.rs`
-- Create: `weir.example.toml`
+- Create: `symfynity.example.toml`
 
 **Interfaces:**
 - Consumes: `config::load_shared`, `config::watch` (Task 6), `BudgetRegistry` (Task 5), `Tokenizer` (Task 7), `gateway::{AppState, router}` (Task 10).
-- Produces: the runnable `weir` binary. Terminal task — no downstream consumers.
+- Produces: the runnable `symfynity` binary. Terminal task — no downstream consumers.
 
 - [ ] **Step 1: Create the example config**
 
-Create `weir.example.toml`:
+Create `symfynity.example.toml`:
 
 ```toml
 [tenants.acct_123]
@@ -1645,18 +1645,18 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use weir::budget::BudgetRegistry;
-use weir::config;
-use weir::gateway::{router, AppState};
-use weir::provider::Tokenizer;
+use symfynity::budget::BudgetRegistry;
+use symfynity::config;
+use symfynity::gateway::{router, AppState};
+use symfynity::provider::Tokenizer;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config_path = env::var("WEIR_CONFIG")
+    let config_path = env::var("SYMFYNITY_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("weir.toml"));
+        .unwrap_or_else(|_| PathBuf::from("symfynity.toml"));
 
     let shared_config = config::load_shared(&config_path)
         .unwrap_or_else(|e| panic!("failed to load config at {}: {e}", config_path.display()));
@@ -1668,15 +1668,15 @@ async fn main() {
         budget: Arc::new(BudgetRegistry::new(shared_config)),
         tokenizer: Arc::new(Tokenizer::load()),
         http: reqwest::Client::new(),
-        openai_base: env::var("WEIR_OPENAI_BASE")
+        openai_base: env::var("SYMFYNITY_OPENAI_BASE")
             .unwrap_or_else(|_| "https://api.openai.com".to_string()),
-        anthropic_base: env::var("WEIR_ANTHROPIC_BASE")
+        anthropic_base: env::var("SYMFYNITY_ANTHROPIC_BASE")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
     };
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    tracing::info!("weir listening on 0.0.0.0:8080");
+    tracing::info!("symfynity listening on 0.0.0.0:8080");
     axum::serve(listener, app).await.unwrap();
 }
 ```
@@ -1686,13 +1686,13 @@ async fn main() {
 Run: `cargo build`
 Expected: builds with no errors.
 
-Run: `WEIR_CONFIG=weir.example.toml cargo run &` then `curl -s localhost:8080/healthz`
+Run: `SYMFYNITY_CONFIG=symfynity.example.toml cargo run &` then `curl -s localhost:8080/healthz`
 Expected: `ok`. Stop the background process afterward (`kill %1`).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/main.rs weir.example.toml
+git add src/main.rs symfynity.example.toml
 git commit -m "feat: wire config, budget registry, and gateway into runnable binary"
 ```
 
@@ -1704,7 +1704,7 @@ git commit -m "feat: wire config, budget registry, and gateway into runnable bin
 - Create: `tests/proxy_flow_test.rs` (extend Task 1's stub with real scenarios)
 
 **Interfaces:**
-- Consumes: `weir::gateway::{AppState, router}`, `weir::budget::BudgetRegistry`, `weir::provider::Tokenizer`, `weir::config::BudgetLimit` — all prior tasks, end to end.
+- Consumes: `symfynity::gateway::{AppState, router}`, `symfynity::budget::BudgetRegistry`, `symfynity::provider::Tokenizer`, `symfynity::config::BudgetLimit` — all prior tasks, end to end.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1720,14 +1720,14 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use weir::budget::BudgetRegistry;
-use weir::config::{BudgetLimit, TenantLimits};
-use weir::gateway::{router, AppState};
-use weir::provider::Tokenizer;
+use symfynity::budget::BudgetRegistry;
+use symfynity::config::{BudgetLimit, TenantLimits};
+use symfynity::gateway::{router, AppState};
+use symfynity::provider::Tokenizer;
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let app = weir::gateway::health_router();
+    let app = symfynity::gateway::health_router();
     let response = app
         .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
         .await
@@ -1770,7 +1770,7 @@ data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1806,7 +1806,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\"should never be forwarded\"}}]}\n\
             Request::builder()
                 .uri("/openai/v1/chat/completions")
                 .method("POST")
-                .header("x-weir-tenant", "acct_1")
+                .header("x-symfynity-tenant", "acct_1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1847,7 +1847,7 @@ git commit -m "test: add end-to-end proxy flow tests against a fake upstream"
 - Create: `tests/budget_concurrency_test.rs`
 
 **Interfaces:**
-- Consumes: `weir::budget::BudgetRegistry`, `weir::config::BudgetLimit`.
+- Consumes: `symfynity::budget::BudgetRegistry`, `symfynity::config::BudgetLimit`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1858,8 +1858,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use weir::budget::BudgetRegistry;
-use weir::config::{BudgetLimit, TenantLimits};
+use symfynity::budget::BudgetRegistry;
+use symfynity::config::{BudgetLimit, TenantLimits};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_streams_never_exceed_ceiling_by_more_than_one_chunk() {
@@ -1943,14 +1943,14 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/weir /usr/local/bin/weir
+COPY --from=builder /build/target/release/symfynity /usr/local/bin/symfynity
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/weir"]
+ENTRYPOINT ["/usr/local/bin/symfynity"]
 ```
 
 - [ ] **Step 3: Verify the image builds for both target architectures**
 
-Run: `docker buildx build --platform linux/amd64,linux/arm64 -t weir:local .`
+Run: `docker buildx build --platform linux/amd64,linux/arm64 -t symfynity:local .`
 Expected: builds successfully for both platforms (requires Docker buildx with QEMU emulation configured, or run natively per-arch if buildx isn't available).
 
 - [ ] **Step 4: Commit**
@@ -1965,5 +1965,5 @@ git commit -m "chore: add multi-arch Dockerfile"
 ## Self-Review Notes
 
 - **Spec coverage:** inline stream interception (Task 9), dynamic micro-budgeting per tenant (Tasks 3, 5), mid-stream eviction + realistic 429-vs-terminal-event split (Tasks 9–10), lock-free hot path (Task 3's atomic CAS design, DashMap sharded map in Task 5), no data persistence (nothing in this plan writes prompt/response bytes to disk or an external store — confirmed by inspection of Tasks 7–9), dual OpenAI/Anthropic adapters (Tasks 7–8), static+hot-reload config (Tasks 4, 6), pass-through auth (Task 10's header-forwarding loop preserves the client's real `Authorization`), multi-arch Docker packaging (Task 14). All spec sections have a corresponding task.
-- **Type consistency:** `BudgetLimit`, `TenantLimits`, `WeirError`, `ChunkCost`, `ProviderAdapter`, `BudgetRegistry::record`/`is_within_budget`, and `enforce(...)`'s signature are each defined once and reused verbatim across every task that consumes them — checked task-by-task while writing this plan.
+- **Type consistency:** `BudgetLimit`, `TenantLimits`, `SymfynityError`, `ChunkCost`, `ProviderAdapter`, `BudgetRegistry::record`/`is_within_budget`, and `enforce(...)`'s signature are each defined once and reused verbatim across every task that consumes them — checked task-by-task while writing this plan.
 - **Known accepted trade-off, stated explicitly:** Task 13's concurrency test cannot assert an exact ceiling under concurrent load — some overshoot is expected and accepted, per the design spec's own acknowledgment of this trade-off for lock-free accounting.

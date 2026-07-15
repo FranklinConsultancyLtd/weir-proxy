@@ -4,7 +4,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::config::{BudgetLimit, PolicyConfig, SharedConfig};
-use crate::error::WeirError;
+use crate::error::SymfynityError;
 use sliding_window::SlidingWindowCounter;
 
 pub struct BudgetRegistry {
@@ -20,25 +20,25 @@ impl BudgetRegistry {
         Self { config, counters: DashMap::new() }
     }
 
-    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, WeirError> {
+    fn limit_for(&self, tenant: &str) -> Result<BudgetLimit, SymfynityError> {
         self.config
             .load()
             .limits
             .get(tenant)
             .copied()
-            .ok_or(WeirError::UnknownTenant)
+            .ok_or(SymfynityError::UnknownTenant)
     }
 
     /// Returns the tenant's configured policy (blocked models/tools). An
     /// unknown tenant is the same error `limit_for` returns for the same
     /// reason — both are reading the same underlying config snapshot.
-    pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, WeirError> {
+    pub fn policy_for(&self, tenant: &str) -> Result<PolicyConfig, SymfynityError> {
         self.config
             .load()
             .policies
             .get(tenant)
             .cloned()
-            .ok_or(WeirError::UnknownTenant)
+            .ok_or(SymfynityError::UnknownTenant)
     }
 
     // Fast path: try a borrowed lookup first to avoid allocating an
@@ -69,7 +69,7 @@ impl BudgetRegistry {
         entry.1.clone()
     }
 
-    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn is_within_budget(&self, tenant: &str, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         Ok(counter.estimate(now_ms) < limit.max_tokens)
@@ -80,7 +80,7 @@ impl BudgetRegistry {
     /// the *next* admission check once genuinely at or over the ceiling
     /// (`is_within_budget` uses strict `<`). This lets a tenant consume its
     /// full budget rather than being cut off one token short of it.
-    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, WeirError> {
+    pub fn record(&self, tenant: &str, amount: u64, now_ms: i64) -> Result<bool, SymfynityError> {
         let limit = self.limit_for(tenant)?;
         let counter = self.counter_for(tenant, limit);
         let total = counter.add(amount, now_ms);
@@ -110,7 +110,7 @@ mod registry_tests {
     fn unknown_tenant_is_rejected() {
         let registry = registry_with("acct_1", 1000, 60);
         let result = registry.is_within_budget("acct_unknown", 0);
-        assert!(matches!(result, Err(WeirError::UnknownTenant)));
+        assert!(matches!(result, Err(SymfynityError::UnknownTenant)));
     }
 
     #[test]
@@ -180,6 +180,6 @@ mod registry_tests {
         assert_eq!(policy.blocked_models, vec!["gpt-3.5-turbo".to_string()]);
         assert_eq!(policy.blocked_tools, vec!["send_email".to_string()]);
 
-        assert!(matches!(registry.policy_for("acct_unknown"), Err(WeirError::UnknownTenant)));
+        assert!(matches!(registry.policy_for("acct_unknown"), Err(SymfynityError::UnknownTenant)));
     }
 }
